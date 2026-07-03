@@ -1,9 +1,9 @@
 // ============================================================
-// ===== RevampedHistory (ready to use) - 1.2.0 - library =====
+// ===== RevampedHistory (ready to use) - 1.2.2 - library =====
 // ============================================================
 // - UnifiedSettings@1.1.2
-// - DuckieDebug@1.0.2
-// - RevampedHistory@1.2.0
+// - DuckieDebug@1.0.3
+// - RevampedHistory@1.2.2
 // ============================================================
 // Paste this ONLY into the library tab in AI Dungeon scripting
 // ============================================================
@@ -331,10 +331,10 @@ function _effectiveField(modName, groupName) {
 // ===========================================================================
 
 function _ensureState() {
-  if (!state.unified_settings || typeof state.unified_settings !== 'object') {
-    state.unified_settings = {};
+  if (!state.unifiedSettings || typeof state.unifiedSettings !== 'object') {
+    state.unifiedSettings = {};
   }
-  return state.unified_settings;
+  return state.unifiedSettings;
 }
 
 function _getCached(modName, groupName, internalKey) {
@@ -347,6 +347,73 @@ function _setCached(modName, groupName, internalKey, value) {
   if (!us[modName])            us[modName] = {};
   if (!us[modName][groupName]) us[modName][groupName] = {};
   us[modName][groupName][internalKey] = value;
+}
+
+
+// ===========================================================================
+// REGISTRY STATE ACCUMULATION
+// ===========================================================================
+
+/**
+ * Merges state.unifiedSettings._registry into the module-level _registry.
+ * Called at the top of ensureSettingCardsExist so registrations from prior
+ * hooks (which reset the module-level _registry on re-evaluation) are
+ * restored. Existing _registry entries are not overwritten.
+ */
+
+function _mergeStateRegistryIntoLocal() {
+  const us = _ensureState();
+  const sr = us._registry;
+  if (!sr || typeof sr !== 'object') return;
+  for (const modName of Object.keys(sr)) {
+    const sm = sr[modName];
+    if (!_registry[modName]) {
+      _registry[modName] = {
+        description: sm.description || '',
+        card:        sm.card        || _defaultCard,
+        field:       sm.field       || '',
+        position:    typeof sm.position === 'number' ? sm.position : 5,
+        groups:      {},
+      };
+    }
+    const lm = _registry[modName];
+    const sg = sm.groups || {};
+    for (const groupName of Object.keys(sg)) {
+      const sgroup = sg[groupName];
+      if (!lm.groups[groupName]) {
+        lm.groups[groupName] = {
+          description: sgroup.description || '',
+          card:        sgroup.card        || null,
+          field:       sgroup.field       || '',
+          position:    typeof sgroup.position === 'number' ? sgroup.position : 5,
+          settings:    [],
+        };
+      }
+      const lgroup = lm.groups[groupName];
+      for (const setting of (sgroup.settings || [])) {
+        if (!lgroup.settings.find(function(s) { return s.internalKey === setting.internalKey; })) {
+          lgroup.settings.push({
+            internalKey:  setting.internalKey,
+            key:          setting.key,
+            defaultValue: setting.defaultValue,
+            description:  setting.description  || '',
+            valueType:    setting.valueType     || null,
+          });
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Serializes the current module-level _registry into state.unifiedSettings._registry.
+ * Called after _mergeStateRegistryIntoLocal so this hook's new registrations
+ * are persisted for future hooks.
+ */
+
+function _saveLocalRegistryToState() {
+  const us = _ensureState();
+  us._registry = JSON.parse(JSON.stringify(_registry));
 }
 
 
@@ -368,8 +435,9 @@ function _renderCardField(cardTitle, field) {
   if (!field) field = _defaultField;
   const lines = [];
 
-  const sortedMods = Object.keys(_registry)
-    .map(function(modName, idx) { return { modName: modName, idx: idx }; })
+  // Build sorted mod entries.
+  const modEntries = Object.keys(_registry)
+    .map(function(modName, idx) { return { kind: 'mod', modName: modName, idx: idx }; })
     .filter(function(e) {
       return Object.keys(_registry[e.modName].groups).some(function(g) {
         return _effectiveCard(e.modName, g) === cardTitle &&
@@ -377,14 +445,41 @@ function _renderCardField(cardTitle, field) {
                _registry[e.modName].groups[g].settings.length > 0;
       });
     })
-    .sort(function(a, b) {
-      const pa = _registry[a.modName].position !== undefined ? _registry[a.modName].position : 5;
-      const pb = _registry[b.modName].position !== undefined ? _registry[b.modName].position : 5;
-      return pa !== pb ? pa - pb : a.idx - b.idx;
+    .map(function(e) {
+      const pos = _registry[e.modName].position !== undefined ? _registry[e.modName].position : 5;
+      return { kind: 'mod', modName: e.modName, idx: e.idx, position: pos };
     });
 
-  for (let mi = 0; mi < sortedMods.length; mi++) {
-    const modName = sortedMods[mi].modName;
+  // Build sorted text block entries from state.
+  // State shape: _textblocks[cardTitle][field][modName][key] = { text, position }
+  const us = _ensureState();
+  const tbState = us._textblocks;
+  const byMod = (tbState && tbState[cardTitle] && tbState[cardTitle][field]) || {};
+  const rawBlocks = [];
+  for (const modName of Object.keys(byMod)) {
+    for (const key of Object.keys(byMod[modName])) {
+      rawBlocks.push(byMod[modName][key]);
+    }
+  }
+  const textEntries = rawBlocks.map(function(b, idx) {
+    return { kind: 'text', text: b.text, idx: modEntries.length + idx, position: typeof b.position === 'number' ? b.position : 5 };
+  });
+
+  // Merge and sort by position then insertion index.
+  const allEntries = modEntries.concat(textEntries).sort(function(a, b) {
+    return a.position !== b.position ? a.position - b.position : a.idx - b.idx;
+  });
+
+  for (let ei = 0; ei < allEntries.length; ei++) {
+    const entry = allEntries[ei];
+    if (ei > 0) { lines.push(''); lines.push(''); }
+
+    if (entry.kind === 'text') {
+      lines.push(entry.text);
+      continue;
+    }
+
+    const modName = entry.modName;
     const modData = _registry[modName];
 
     const relevantGroups = Object.keys(modData.groups)
@@ -400,8 +495,6 @@ function _renderCardField(cardTitle, field) {
         return pa !== pb ? pa - pb : a.idx - b.idx;
       })
       .map(function(e) { return e.groupName; });
-
-    if (mi > 0) { lines.push(''); lines.push(''); }
 
     lines.push('- ' + modName + (modData.description ? ' | ' + modData.description : ''));
 
@@ -427,7 +520,7 @@ function _renderCardField(cardTitle, field) {
       }
       return lines.join('\n');
     }
-    return { _normalizeValue, _parseArray, _serializeArray, _simplify, _fuzzyMatchTitle, _fuzzyFindCard, _parseCardEntry, _parseCardSections, _escapeRegex, _effectiveCard, _effectiveField, _ensureState, _getCached, _setCached, _renderCardField, _registry, _defaultCard, _defaultGroup, _defaultField };
+    return { _normalizeValue, _parseArray, _serializeArray, _simplify, _fuzzyMatchTitle, _fuzzyFindCard, _parseCardEntry, _parseCardSections, _escapeRegex, _effectiveCard, _effectiveField, _ensureState, _getCached, _setCached, _mergeStateRegistryIntoLocal, _saveLocalRegistryToState, _renderCardField, _registry, _defaultCard, _defaultGroup, _defaultField };
   })();
 
   static input(text) {
@@ -507,6 +600,9 @@ function _renderCardField(cardTitle, field) {
   }
 
   static ensureSettingCardsExist() {
+    // Restore registrations from prior hooks (module-level UnifiedSettings.#lib._registry resets each hook).
+    UnifiedSettings.#lib._mergeStateRegistryIntoLocal();
+  
     // Collect unique card titles and the set of fields used on each card.
     const cardFields = {}; // cardTitle → Set of field strings
     for (const modName of Object.keys(UnifiedSettings.#lib._registry)) {
@@ -520,16 +616,39 @@ function _renderCardField(cardTitle, field) {
       }
     }
   
+    // Persist complete registry to state so future hooks (which re-evaluate the
+    // module) can restore all registrations via UnifiedSettings.#lib._mergeStateRegistryIntoLocal.
+    UnifiedSettings.#lib._saveLocalRegistryToState();
+  
+    // Track every card+field we have ever managed so removals still trigger a
+    // re-render (clearing stale content) even when the registry is now empty
+    // for that card.
+    const usForManaged = UnifiedSettings.#lib._ensureState();
+    if (!usForManaged._managedCards) usForManaged._managedCards = {};
+    for (const ct of Object.keys(cardFields)) {
+      if (!usForManaged._managedCards[ct]) usForManaged._managedCards[ct] = [];
+      for (const f of cardFields[ct]) {
+        if (usForManaged._managedCards[ct].indexOf(f) === -1) usForManaged._managedCards[ct].push(f);
+      }
+    }
+    for (const ct of Object.keys(usForManaged._managedCards)) {
+      if (!cardFields[ct]) cardFields[ct] = new Set();
+      for (const f of usForManaged._managedCards[ct]) cardFields[ct].add(f);
+    }
+  
     for (const cardTitle of Object.keys(cardFields)) {
       const fields = cardFields[cardTitle];
       let card = UnifiedSettings.#lib._fuzzyFindCard(cardTitle);
+      const us = UnifiedSettings.#lib._ensureState();
+      const byMod = (us._cardkeys && us._cardkeys[cardTitle]) || {};
+      const cardKeys = Object.keys(byMod).map(function(m) { return byMod[m]; }).filter(Boolean).join(', ');
   
       if (!card) {
         addStoryCard(cardTitle);
         card = storyCards[storyCards.length - 1];
         if (card) {
           card.type = 'zz_Settings';
-          card.keys = '';
+          card.keys = cardKeys;
           for (const field of fields) {
             card[field] = UnifiedSettings.#lib._renderCardField(cardTitle, field);
           }
@@ -567,7 +686,17 @@ function _renderCardField(cardTitle, field) {
         card[field] = UnifiedSettings.#lib._renderCardField(cardTitle, field);
       }
   
-      card.keys = '';
+      card.keys = cardKeys;
+  
+      // Delete the card if it is now completely empty (no settings, no text
+      // blocks, no keys). Also purge it from _managedCards so future hook calls
+      // do not attempt to re-create it.
+      const allFieldsEmpty = Array.from(fields).every(function(f) { return !card[f]; });
+      if (allFieldsEmpty && !cardKeys) {
+        const idx = storyCards.indexOf(card);
+        if (idx !== -1) storyCards.splice(idx, 1);
+        delete usForManaged._managedCards[cardTitle];
+      }
     }
   }
 
@@ -629,6 +758,81 @@ function _renderCardField(cardTitle, field) {
   static resetModSetting(modName, internalKey) {
     UnifiedSettings.resetSetting(modName, UnifiedSettings.#lib._defaultGroup, internalKey);
   }
+
+  static defineText(obj) {
+    if (!obj || !obj.modName || !obj.key || obj.text == null) return;
+    const cardTitle = obj.card || UnifiedSettings.#lib._defaultCard;
+    const field     = obj.field     || UnifiedSettings.#lib._defaultField;
+    const position  = typeof obj.position === 'number' ? obj.position : 5;
+    const us = UnifiedSettings.#lib._ensureState();
+    if (!us._textblocks)                                          us._textblocks = {};
+    if (!us._textblocks[cardTitle])                               us._textblocks[cardTitle] = {};
+    if (!us._textblocks[cardTitle][field])                        us._textblocks[cardTitle][field] = {};
+    if (!us._textblocks[cardTitle][field][obj.modName])           us._textblocks[cardTitle][field][obj.modName] = {};
+    us._textblocks[cardTitle][field][obj.modName][obj.key] = { text: obj.text, position: position };
+  }
+
+  static removeText(modName, key) {
+    const us = UnifiedSettings.#lib._ensureState();
+    if (!us._textblocks) return;
+    for (const cardTitle of Object.keys(us._textblocks)) {
+      for (const field of Object.keys(us._textblocks[cardTitle])) {
+        const byMod = us._textblocks[cardTitle][field];
+        if (byMod[modName]) {
+          delete byMod[modName][key];
+        }
+      }
+    }
+  }
+
+  static defineCardKeys(modName, cardTitle, text) {
+    const us = UnifiedSettings.#lib._ensureState();
+    if (!us._cardkeys)              us._cardkeys = {};
+    if (!us._cardkeys[cardTitle])   us._cardkeys[cardTitle] = {};
+    us._cardkeys[cardTitle][modName] = text;
+  }
+
+  static removeCardKeys(modName, cardTitle) {
+    const us = UnifiedSettings.#lib._ensureState();
+    if (us._cardkeys && us._cardkeys[cardTitle]) {
+      delete us._cardkeys[cardTitle][modName];
+    }
+  }
+
+  static removeSetting(modName, groupName, internalKey) {
+    const groups = UnifiedSettings.#lib._registry[modName] && UnifiedSettings.#lib._registry[modName].groups;
+    const settings = groups && groups[groupName] && groups[groupName].settings;
+    if (settings) {
+      const idx = settings.findIndex(function(s) { return s.internalKey === internalKey; });
+      if (idx !== -1) settings.splice(idx, 1);
+    }
+    const us = UnifiedSettings.#lib._ensureState();
+    const sr = us.UnifiedSettings.#lib._registry;
+    const sgroups = sr && sr[modName] && sr[modName].groups;
+    const ssettings = sgroups && sgroups[groupName] && sgroups[groupName].settings;
+    if (ssettings) {
+      const idx = ssettings.findIndex(function(s) { return s.internalKey === internalKey; });
+      if (idx !== -1) ssettings.splice(idx, 1);
+    }
+  }
+
+  static removeGroup(modName, groupName) {
+    if (UnifiedSettings.#lib._registry[modName] && UnifiedSettings.#lib._registry[modName].groups) {
+      delete UnifiedSettings.#lib._registry[modName].groups[groupName];
+    }
+    const us = UnifiedSettings.#lib._ensureState();
+    const sr = us.UnifiedSettings.#lib._registry;
+    if (sr && sr[modName] && sr[modName].groups) {
+      delete sr[modName].groups[groupName];
+    }
+  }
+
+  static removeMod(modName) {
+    delete UnifiedSettings.#lib._registry[modName];
+    const us = UnifiedSettings.#lib._ensureState();
+    const sr = us.UnifiedSettings.#lib._registry;
+    if (sr) delete sr[modName];
+  }
 }
 
 class DuckieDebug {
@@ -637,61 +841,60 @@ class DuckieDebug {
     
     const DUCKIE_DEBUG_CARD = 'Duckie Debug Data';
     const DUCKIE_DEBUG_TYPE = 'zz_Debug';
-    const DUCKIE_DEBUG_MODE = 1
+    const DUCKIE_DEBUG_MODE = 1;
+    const DUCKIE_MOD_NAME = "DuckieDebug";
+    const DUCKIE_SETTING_KEY = 'Debug Mode';
+    const DUCKIE_FIELD = 'description';
+    
     
     const DEFAULT_SETTINGS = {
       modName: 'DuckieDebug',
       setting: {
-        debugMode: { key: 'Debug Mode', defaultValue: DUCKIE_DEBUG_MODE, valueType: 'num' },
+        debugMode: { key: DUCKIE_SETTING_KEY, defaultValue: DUCKIE_DEBUG_MODE, valueType: 'num' },
+        field:    DUCKIE_FIELD
       }
     };
     
     function preHook(){
-        UnifiedSettings.defineMod('DuckieDebug', 'Debug output level', undefined, undefined, 9);
+        UnifiedSettings.defineMod(DUCKIE_MOD_NAME, 'Debug output level', undefined, undefined, 9);
         UnifiedSettings.defineSettings(DEFAULT_SETTINGS);
     }
-    return { preHook, _duckieDebugLevel, DUCKIE_DEBUG_CARD, DUCKIE_DEBUG_TYPE, DUCKIE_DEBUG_MODE, DEFAULT_SETTINGS };
+    return { preHook, _duckieDebugLevel, DUCKIE_DEBUG_CARD, DUCKIE_DEBUG_TYPE, DUCKIE_DEBUG_MODE, DUCKIE_MOD_NAME, DUCKIE_SETTING_KEY, DUCKIE_FIELD, DEFAULT_SETTINGS };
   })();
 
   static duckieDebugMode = { OFF: 0, ERROR: 1, INFORM: 2 };
 
-  static preInput(text) {
-    DuckieDebug.resetDebugMode('Input', UnifiedSettings.getModSetting('DuckieDebug', 'debugMode'));
+  static input(text) {
+    DuckieDebug.applyDebugLevel ('Input', DuckieDebug.getLevel());
   
     return { text };
   }
 
-  static preContext(text) {
-    DuckieDebug.resetDebugMode('Context', UnifiedSettings.getModSetting('DuckieDebug', 'debugMode'));
+  static context(text) {
+    DuckieDebug.applyDebugLevel ('Context', DuckieDebug.getLevel());
   
     return { text };
   }
 
-  static preOutput(text) {
-    DuckieDebug.resetDebugMode('Output', UnifiedSettings.getModSetting('DuckieDebug', 'debugMode'));
+  static output(text) {
+    DuckieDebug.applyDebugLevel ('Output', DuckieDebug.getLevel());
     
     return { text };
   }
 
   static preInput(text) {
     DuckieDebug.#lib.preHook();
-  
-    return { text };
   }
 
   static preContext(text) {
     DuckieDebug.#lib.preHook();
-  
-    return { text };
   }
 
   static preOutput(text) {
     DuckieDebug.#lib.preHook();
-    
-    return { text };
   }
 
-  static resetDebugMode(modifierName, level) {
+  static applyDebugLevel (modifierName, level) {
     DuckieDebug.#lib._duckieDebugLevel = typeof level === 'number' ? level : (level ? 2 : 0);
     DuckieDebug.duckieDebug(`Turn ${info.actionCount} - ${modifierName}`, DuckieDebug.duckieDebugMode.ERROR);
   }
@@ -710,7 +913,7 @@ class DuckieDebug {
       if (card) {
         card.type        = DuckieDebug.#lib.DUCKIE_DEBUG_TYPE;
         card.keys        = '';
-        card.description = 'duckie debug output — set Debug Mode to 0 in Settings to hide';
+        card.description = 'duckie debug DuckieDebug.output — set Debug Mode to 0 in Settings to hide';
       }
     }
     if (card) {
@@ -719,7 +922,7 @@ class DuckieDebug {
   }
 
   static getLevel() {
-    return DuckieDebug.#lib._duckieDebugLevel;
+    return UnifiedSettings.getModSetting(DuckieDebug.#lib.DUCKIE_MOD_NAME, "debugMode");
   }
 }
 
@@ -804,6 +1007,13 @@ class RevampedHistory {
       return card ? card : null;
     }
     
+    
+    function updateHistoryDebugCards() {
+      if (DuckieDebug.getLevel() > DuckieDebug.duckieDebugMode.OFF) {
+        updateDebugCard();
+        updateAidDebugCard();
+      }
+    }
     
     
     
@@ -894,6 +1104,10 @@ class RevampedHistory {
     
     // --- history ops ---
     
+    
+    
+    const AMBIGUOUS_DELTA = 0.20;
+    
     function pushAction(state, text, actionType, scriptData = {}) {
       state.rvh.history.push({ text, actionType, retries: [], scriptData });
       if (state.rvh.history.length > state.rvh.historyMaxLength) {
@@ -901,22 +1115,11 @@ class RevampedHistory {
       }
     }
     
-    // Demotes the current last entry (text + actionType + scriptData) into its own retries array,
-    // then replaces the canonical text with newText and resets scriptData for the new winner.
-    function pushRetry(state, newText, newScriptData = {}) {
-      const last = state.rvh.history[state.rvh.history.length - 1];
-      if (!last) return;
-      last.retries.push({ text: last.text, actionType: last.actionType, scriptData: last.scriptData });
-      last.text = newText;
-      last.scriptData = newScriptData;
-    }
     
-    // Removes history entries from index onward and returns the removed tail.
     function trimToIndex(state, index) {
       return state.rvh.history.splice(index);
     }
     
-    // Saves a diverged history tail to altHistory, evicting the oldest branch if over the cap.
     function saveAltHistory(state, firstTurn, tail) {
       state.rvh.altHistory.unshift({ firstTurn, history: tail });
       if (state.rvh.altHistory.length > state.rvh.maxAltHistories) {
@@ -924,8 +1127,6 @@ class RevampedHistory {
       }
     }
     
-    // Searches altHistory for the branch that best matches the current AID history,
-    // restores it, and removes it from altHistory. Returns true if a branch was restored.
     function restoreAltHistory(state, aidCount, aidHistory) {
       let bestBranch = null;
       let bestScore = -1;
@@ -951,6 +1152,8 @@ class RevampedHistory {
     
     // When the player stops retrying, AID's history reveals which response they picked.
     // If it matches a stored retry rather than the current winner, swap it in.
+    // Sets rvh.ambiguous if the match is low-confidence (scores within AMBIGUOUS_DELTA of each other).
+    // Prioritizes the canonical entry, then retries with scriptData, as tiebreakers.
     function resolveRetryWinner(state, aidHistory) {
       const last = state.rvh.history[state.rvh.history.length - 1];
       if (!last || last.retries.length === 0) return;
@@ -958,29 +1161,87 @@ class RevampedHistory {
       const aidLast = aidHistory[aidHistory.length - 1];
       if (!aidLast) return;
     
-      if (jaccardSimilarity(aidLast.text, last.text) >= SIMILARITY_THRESHOLD) return;
+      // Score canonical and all retries
+      const canonicalSim = jaccardSimilarity(aidLast.text, last.text);
     
-      const idx = last.retries.findIndex(
-        r => jaccardSimilarity(aidLast.text, r.text) >= SIMILARITY_THRESHOLD
-      );
-      if (idx === -1) return;
+      const retrySims = last.retries.map((r, i) => ({
+        index: i,
+        sim: jaccardSimilarity(aidLast.text, r.text),
+        hasScriptData: r.scriptData && Object.keys(r.scriptData).length > 0,
+      }));
     
-      const picked = last.retries[idx];
-      last.retries.splice(idx, 1);
+      // Find the best retry score
+      const bestRetry = retrySims.reduce((best, r) => r.sim > best.sim ? r : best, retrySims[0]);
+    
+      // Canonical wins unless a retry beats it clearly
+      if (bestRetry.sim <= canonicalSim) {
+        // Canonical is best or tied — check for ambiguity among close competitors
+        const considered = retrySims.filter(r => r.sim >= bestRetry.sim - AMBIGUOUS_DELTA);
+        if (considered.length > 0 && bestRetry.sim >= canonicalSim - AMBIGUOUS_DELTA) {
+          state.rvh.ambiguous = {
+            index: state.rvh.history.length - 1,
+            chosenAction: { text: last.text, scriptData: last.scriptData },
+            consideredAlts: considered.map(r => ({
+              text: last.retries[r.index].text,
+              scriptData: last.retries[r.index].scriptData,
+            })),
+          };
+        }
+        return;
+      }
+    
+      // A retry beats canonical — find the best among close competitors,
+      // preferring retries with scriptData as tiebreaker
+      const candidates = retrySims.filter(r => r.sim >= bestRetry.sim - AMBIGUOUS_DELTA);
+      const winner = candidates.reduce((best, r) => {
+        if (r.sim > best.sim) return r;
+        if (r.sim === best.sim && r.hasScriptData && !best.hasScriptData) return r;
+        return best;
+      }, candidates[0]);
+    
+      // Flag ambiguity if canonical or other retries were close
+      const otherCandidates = [
+        { text: last.text, scriptData: last.scriptData, sim: canonicalSim },
+        ...retrySims
+          .filter(r => r.index !== winner.index && r.sim >= bestRetry.sim - AMBIGUOUS_DELTA)
+          .map(r => ({ text: last.retries[r.index].text, scriptData: last.retries[r.index].scriptData, sim: r.sim })),
+      ].filter(c => c.sim >= bestRetry.sim - AMBIGUOUS_DELTA);
+    
+      if (otherCandidates.length > 0) {
+        DuckieDebug.duckieDebug("Ambiguous Action Found", DuckieDebug.duckieDebugMode.ERROR);
+        state.rvh.ambiguous = {
+          index: state.rvh.history.length - 1,
+          chosenAction: { text: last.retries[winner.index].text, scriptData: last.retries[winner.index].scriptData },
+          consideredAlts: otherCandidates.map(c => ({ text: c.text, scriptData: c.scriptData })),
+        };
+      }
+    
+      // Promote the winner
+      const promoted = last.retries.splice(winner.index, 1)[0];
       last.retries.push({ text: last.text, actionType: last.actionType, scriptData: last.scriptData });
-      last.text = picked.text;
-      last.actionType = picked.actionType;
-      last.scriptData = picked.scriptData;
+      last.text = promoted.text;
+      last.actionType = promoted.actionType;
+      last.scriptData = promoted.scriptData;
     }
     
-    // Applies a list of detected text edits to rvh.history entries to keep stored prose fresh.
-    // When the entry has stored retries, promotes the retry whose text best matches newText
-    // so that the associated scriptData is preserved correctly.
     function freshenText(state, edits) {
+      const last = state.rvh.history.length - 1;
+      const secondLast = state.rvh.history.length - 2;
+      const safeSwapFrom = (secondLast >= 0 && state.rvh.history[secondLast].actionType !== 'continue')
+        ? secondLast
+        : last;
+    
       for (const { rvhIdx, newText } of edits) {
         const entry = state.rvh.history[rvhIdx];
         if (!entry) continue;
     
+        if (rvhIdx < safeSwapFrom) {
+          // Older entry: update text only, never promote a retry
+          entry.text = newText;
+          continue;
+        }
+    
+        // Recent entry: allow retry promotion as before
         let bestSim = jaccardSimilarity(newText, entry.text);
         let bestRetryIdx = -1;
     
@@ -1003,20 +1264,10 @@ class RevampedHistory {
       }
     }
     
-    // Pushes AID history entries into rvh.history starting at fromIdx,
-    // using each entry's type directly as actionType.
     function backfillFromAidHistory(state, aidHistory, fromIdx) {
       for (let i = fromIdx; i < aidHistory.length; i++) {
         const entry = aidHistory[i];
         if (entry) pushAction(state, entry.text, entry.type, {});
-      }
-    }
-    
-    // Debug Cards
-    function updateHistoryDebugCards(){
-      if(DuckieDebug.getLevel() > 1){
-        updateDebugCard();
-        updateAidDebugCard();
       }
     }
     
@@ -1065,17 +1316,14 @@ class RevampedHistory {
       const unionCount = set1.size + set2.size - intersectionCount;
       return unionCount === 0 ? 0 : intersectionCount / unionCount;
     }
-    return { updateDebugCard, updateAidDebugCard, getOrCreateCard, getStoryCardEntryByTitle, inferActionType, findHistoryMatch, classifyStateChange, trailingContinueCount, pushAction, pushRetry, trimToIndex, saveAltHistory, restoreAltHistory, resolveRetryWinner, freshenText, backfillFromAidHistory, updateHistoryDebugCards, rvhEnsureInit, computeBigrams, jaccardSimilarity, DEBUG_CARD_TYPE, MATCH_CONFIDENCE_RATIO, LOOKBACK_WINDOW, MAX_CONSECUTIVE_MISMATCHES, AID_HISTORY_CAP, SIMILARITY_THRESHOLD };
+    return { updateDebugCard, updateAidDebugCard, getOrCreateCard, getStoryCardEntryByTitle, updateHistoryDebugCards, inferActionType, findHistoryMatch, classifyStateChange, trailingContinueCount, pushAction, trimToIndex, saveAltHistory, restoreAltHistory, resolveRetryWinner, freshenText, backfillFromAidHistory, rvhEnsureInit, computeBigrams, jaccardSimilarity, DEBUG_CARD_TYPE, MATCH_CONFIDENCE_RATIO, LOOKBACK_WINDOW, MAX_CONSECUTIVE_MISMATCHES, AID_HISTORY_CAP, AMBIGUOUS_DELTA, SIMILARITY_THRESHOLD };
   })();
 
   static preInput(text) {
     RevampedHistory.#lib.rvhEnsureInit(state);
     const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
+    RevampedHistory.#lib.resolveRetryWinner(state, history);
     RevampedHistory.#lib.freshenText(state, edits);
-  
-    if (changeType !== 'retry' && changeType !== 'start') {
-      RevampedHistory.#lib.resolveRetryWinner(state, history);
-    }
   
     if (changeType === 'rewind') {
       const divergeIdx = info.actionCount - 1;
@@ -1086,22 +1334,28 @@ class RevampedHistory {
     } else if (changeType === 'redo') {
       const restored = RevampedHistory.#lib.restoreAltHistory(state, info.actionCount - 1, history);
       if (!restored) {
-        // No matching alt branch; sync count with AID and treat as a fresh new action.
         state.rvh.actionCount = info.actionCount - 1;
       }
       state.rvh.actionCount++;
     } else if (changeType === 'new') {
       state.rvh.actionCount++;
     }
-    // retry: no increment
   
-    let actionType = RevampedHistory.#lib.inferActionType(text)
-    if( changeType === 'start'){
+    let actionType = RevampedHistory.#lib.inferActionType(text);
+    if (changeType === 'start') {
       actionType = 'start';
     }
     state.rvh.playerAction = { changeType, actionType, text, scriptData: {} };
-  
-    return { text };
+  }
+
+  static popRetryAiEntry(state) {
+    const popped = state.rvh.history.pop();
+    state.rvh.aiAction = {
+      actionType: popped.actionType,
+      text:       null,
+      scriptData: {},
+      retries:    [...popped.retries, { text: popped.text, actionType: popped.actionType, scriptData: popped.scriptData }],
+    };
   }
 
   static preContext(text) {
@@ -1109,108 +1363,96 @@ class RevampedHistory {
     state.rvh.aiAction = { actionType: 'continue', text: null, scriptData: {} };
   
     if (state.rvh.playerAction) {
-      if (state.rvh.playerAction.changeType !== 'retry' ) { 
+      if (state.rvh.playerAction.changeType !== 'retry') {
         DuckieDebug.duckieDebug("Player Action", 2);
         state.rvh.actionCount++;
+      } else {
+        RevampedHistory.popRetryAiEntry(state);
       }
-      return { text };
-    }
+    } else {
   
-    // Continue Action: input hook never fired
-    const aidCount = info.actionCount;
-    const rvhCount = state.rvh.actionCount;
+      const aidCount = info.actionCount;
+      const rvhCount = state.rvh.actionCount;
   
-    if (aidCount < rvhCount || aidCount > rvhCount + 1) {
-      // Count is unambiguously off: rewind or redo (or late-init on first activation).
-      // Skip the trailing-continue retry check — it would misfire here.
-      const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
-      RevampedHistory.#lib.freshenText(state, edits);
-      RevampedHistory.#lib.resolveRetryWinner(state, history);
-      state.rvh.aiAction.changeType = changeType;
+     if (aidCount < rvhCount || aidCount > rvhCount + 1) {
+        const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
+        RevampedHistory.#lib.resolveRetryWinner(state, history);
+        RevampedHistory.#lib.freshenText(state, edits);
+        state.rvh.aiAction.changeType = changeType;
   
-      if (changeType === 'rewind') {
-        const divergeIdx = aidCount - 1;
-        const tail = RevampedHistory.#lib.trimToIndex(state, divergeIdx);
-        RevampedHistory.#lib.saveAltHistory(state, divergeIdx, tail);
-        state.rvh.actionCount = divergeIdx;
-      } else if (changeType === 'redo') {
-        const restored = RevampedHistory.#lib.restoreAltHistory(state, aidCount - 1, history);
-        if (!restored) {
-          // No matching alt branch — late-init sync or redo with no saved branch
-          RevampedHistory.#lib.backfillFromAidHistory(state, history, state.rvh.history.length);
-          state.rvh.actionCount = aidCount - 1;
+        if (changeType === 'rewind') {
+          const divergeIdx = aidCount - 1;
+          const tail = RevampedHistory.#lib.trimToIndex(state, divergeIdx);
+          RevampedHistory.#lib.saveAltHistory(state, divergeIdx, tail);
+          state.rvh.actionCount = divergeIdx;
+        } else if (changeType === 'redo') {
+          const restored = RevampedHistory.#lib.restoreAltHistory(state, aidCount - 1, history);
+          if (!restored) {
+            RevampedHistory.#lib.backfillFromAidHistory(state, history, state.rvh.history.length);
+            state.rvh.actionCount = aidCount - 1;
+          }
+        }
+        state.rvh.actionCount++;
+      } else {
+        let aidTrailing = 0;
+        for (let i = history.length - 1; i >= 0; i--) {
+          if (history[i].type !== 'continue') break;
+          aidTrailing++;
+        }
+        if (aidTrailing < state.rvh.expectedAidContinueDepth) {
+          RevampedHistory.popRetryAiEntry(state);
+          state.rvh.playerAction = { changeType: 'retry', actionType: 'continue', text: null, scriptData: {} };
+        } else {
+          const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
+          RevampedHistory.#lib.resolveRetryWinner(state, history);
+          RevampedHistory.#lib.freshenText(state, edits);
+          state.rvh.aiAction.changeType = changeType;
+          state.rvh.actionCount++;
         }
       }
-      state.rvh.actionCount++;
-    } else {
-      // Count is in the expected range (new continue or retry).
-      // Use trailing-continue depth to distinguish retry from a genuine new continue.
-      let aidTrailing = 0;
-      for (let i = history.length - 1; i >= 0; i--) {
-        if (history[i].type !== 'continue') break;
-        aidTrailing++;
-      }
-      if (aidTrailing < state.rvh.expectedAidContinueDepth) {
-        // Continue-Retry: trailing continues short of expected → last AI entry was popped
-        state.rvh.playerAction = { changeType: 'retry', actionType: 'continue', text: null, scriptData: {} };
-      } else {
-        // New Continue
-        const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
-        RevampedHistory.#lib.freshenText(state, edits);
-        RevampedHistory.#lib.resolveRetryWinner(state, history);
-        state.rvh.aiAction.changeType = changeType;
-        state.rvh.actionCount++;
-      }
     }
-  
-    return { text };
   }
 
   static postInput(text) {
     state.rvh.playerAction.text = text;
-    return { text };
   }
 
   static postOutput(text) {
-  
     RevampedHistory.#lib.rvhEnsureInit(state);
     const playerAction = state.rvh.playerAction;
     const aiAction     = state.rvh.aiAction;
   
     if (!playerAction) {
-  
       if (aiAction) {
         aiAction.text = text;
         RevampedHistory.#lib.pushAction(state, aiAction.text, aiAction.actionType, aiAction.scriptData);
         state.rvh.aiAction = null;
       }
+      state.rvh.ambiguous = null;
+      state.rvh.expectedAidContinueDepth = Math.min(RevampedHistory.#lib.trailingContinueCount(history) + 1, RevampedHistory.#lib.AID_HISTORY_CAP);
+      RevampedHistory.#lib.updateHistoryDebugCards();
+    } else {
+      aiAction.text = text;
+  
+      if (playerAction.changeType === 'retry') {
+        state.rvh.history.push({ text: aiAction.text, actionType: aiAction.actionType, scriptData: aiAction.scriptData, retries: aiAction.retries });
+        if (state.rvh.history.length > state.rvh.historyMaxLength) state.rvh.history.shift();
+      } else {
+        const lastEntry = history[history.length - 1];
+        if (lastEntry && lastEntry.type && lastEntry.type !== playerAction.actionType) {
+          playerAction.actionType = lastEntry.type;
+        }
+        RevampedHistory.#lib.pushAction(state, playerAction.text, playerAction.actionType, playerAction.scriptData);
+        RevampedHistory.#lib.pushAction(state, aiAction.text,     aiAction.actionType,     aiAction.scriptData);
+      }
+  
+      state.rvh.playerAction = null;
+      state.rvh.aiAction     = null;
+      state.rvh.ambiguous    = null;
   
       state.rvh.expectedAidContinueDepth = Math.min(RevampedHistory.#lib.trailingContinueCount(history) + 1, RevampedHistory.#lib.AID_HISTORY_CAP);
       RevampedHistory.#lib.updateHistoryDebugCards();
-  
-      return { text };
     }
-  
-    aiAction.text = text;
-  
-    if (playerAction.changeType === 'retry') {
-      RevampedHistory.#lib.pushRetry(state, aiAction.text, aiAction.scriptData);
-    } else {
-      const lastEntry = history[history.length - 1];
-      if (lastEntry && lastEntry.type && lastEntry.type !== playerAction.actionType) {
-        playerAction.actionType = lastEntry.type;
-      }
-      RevampedHistory.#lib.pushAction(state, playerAction.text, playerAction.actionType, playerAction.scriptData);
-      RevampedHistory.#lib.pushAction(state, aiAction.text,     aiAction.actionType,     aiAction.scriptData);
-    }
-  
-    state.rvh.playerAction = null;
-    state.rvh.aiAction     = null;
-  
-    state.rvh.expectedAidContinueDepth = Math.min(RevampedHistory.#lib.trailingContinueCount(history) + 1, RevampedHistory.#lib.AID_HISTORY_CAP);
-  
-    RevampedHistory.#lib.updateHistoryDebugCards();
-    return { text };
   }
 
   static getPendingPlayerAction() {
@@ -1300,5 +1542,28 @@ class RevampedHistory {
     const hist = state.rvh?.history;
     if (!hist) return [];
     return hist.slice(start, end).map(RevampedHistory._entrySnapshot);
+  }
+
+  static haveAmbiguous() {
+    return !!state.rvh?.ambiguous;
+  }
+
+  static getAmbiguousIndex() {
+    return state.rvh?.ambiguous?.index ?? null;
+  }
+
+  static getAmbiguousText() {
+    return state.rvh?.ambiguous?.consideredAlts.map(a => a.text) ?? [];
+  }
+
+  static getAmbiguousScriptData(namespace, key) {
+    const alts = state.rvh?.ambiguous?.consideredAlts;
+    if (!alts) return [];
+    return alts.map(a => {
+      if (!a.scriptData) return null;
+      const ns = a.scriptData[namespace];
+      if (!ns) return null;
+      return key !== undefined ? (ns[key] ?? null) : ns;
+    });
   }
 }
