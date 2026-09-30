@@ -1,8 +1,8 @@
 // ============================================================
-// ===== RevampedHistory (ready to use) - 1.4.0 - context =====
+// ===== RevampedHistory (ready to use) - 1.5.0 - context =====
 // ============================================================
 // - UnifiedSettings@1.1.2
-// - RevampedHistory@1.4.0
+// - RevampedHistory@1.5.0
 // ============================================================
 // Paste this ONLY into the context tab in AI Dungeon scripting
 // ============================================================

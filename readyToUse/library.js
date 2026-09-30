@@ -1,9 +1,9 @@
 // ============================================================
-// ===== RevampedHistory (ready to use) - 1.4.0 - library =====
+// ===== RevampedHistory (ready to use) - 1.5.0 - library =====
 // ============================================================
 // - UnifiedSettings@1.1.2
 // - DuckieDebug@2.0.0
-// - RevampedHistory@1.4.0
+// - RevampedHistory@1.5.0
 // ============================================================
 // Paste this ONLY into the library tab in AI Dungeon scripting
 // ============================================================
@@ -978,10 +978,10 @@ class RevampedHistory {
     const DEBUG_CARD_TYPE = 'zz_Debug';
     
     function updateDebugCard() {
-      const history = state.rvh?.history;
-      if (!history) return;
+      const rvhHistory = state.rvh?.history;
+      if (!rvhHistory) return;
     
-      const lines = history.map((entry, i) => {
+      const lines = rvhHistory.map((entry, i) => {
         const retryCount = entry.retries?.length ?? 0;
         const preview = entry.text.slice(0, 80).replace(/\n/g, ' ');
         let line = `[${i}] ${entry.actionType}: "${preview}"`;
@@ -999,7 +999,7 @@ class RevampedHistory {
       });
     
       const body = lines.length
-        ? `count: ${history.length} | actions: ${state.rvh.actionCount}\n\n${lines.join('\n')}`
+        ? `count: ${rvhHistory.length} | actions: ${state.rvh.actionCount}\n\n${lines.join('\n')}`
         : `(empty) | actions: ${state.rvh.actionCount}`;
     
       getOrCreateCard('[RVH Debug]',
@@ -1011,11 +1011,9 @@ class RevampedHistory {
     }
     
     function updateAidDebugCard() {
-      if (!history) return;
-    
       const lines = history.map((entry, i) => {
         const preview = (entry.text ?? '').slice(0, 80).replace(/\n/g, ' ');
-        return `[${i}] ${entry.type ?? entry.actionType ?? '?'}: "${preview}"`;
+        return `[${i}] ${entry.type ?? '?'}: "${preview}"`;
       });
     
       const body = lines.length
@@ -1191,8 +1189,13 @@ class RevampedHistory {
       return state.rvh.history.splice(index);
     }
     
-    function saveAltHistory(state, firstTurn, tail) {
-      state.rvh.altHistory.unshift({ firstTurn, history: tail });
+    // forkTurn is set only when the timeline split before the branch's first entry
+    // (a rewind past all tracking): the actions between forkTurn and firstTurn were
+    // never tracked on the branch's timeline.
+    function saveAltHistory(state, firstTurn, tail, forkTurn) {
+      const branch = { firstTurn, history: tail };
+      if (forkTurn !== undefined && forkTurn < firstTurn) branch.forkTurn = forkTurn;
+      state.rvh.altHistory.unshift(branch);
       if (state.rvh.altHistory.length > state.rvh.maxAltHistories) {
         state.rvh.altHistory.pop();
       }
@@ -1215,20 +1218,98 @@ class RevampedHistory {
     
       if (!bestBranch) return false;
     
-      // firstTurn is an action count; convert to an array index via the offset.
-      const attachAt = countToIndex(state, bestBranch.firstTurn);
-      if (attachAt < 0) return false; // branch predates the tracked range; cannot reattach
-    
-      state.rvh.history = state.rvh.history.slice(0, attachAt).concat(bestBranch.history);
+      if (bestBranch.forkTurn !== undefined) {
+        restoreForkedBranch(state, bestBranch, aidCount, aidHistory);
+      } else {
+        // firstTurn is an action count; convert to an array index via the offset.
+        const attachAt = countToIndex(state, bestBranch.firstTurn);
+        if (attachAt < 0) return false; // branch predates the tracked range; cannot reattach
+        state.rvh.history = state.rvh.history.slice(0, attachAt).concat(bestBranch.history);
+      }
       state.rvh.actionCount = bestBranch.firstTurn + bestBranch.history.length;
       state.rvh.altHistory = state.rvh.altHistory.filter(b => b !== bestBranch);
       return true;
     }
     
-    // When the player stops retrying, AID's history reveals which response they picked.
-    // If it matches a stored retry rather than the current winner, swap it in.
-    // Sets rvh.ambiguous if the match is low-confidence (scores within AMBIGUOUS_DELTA of each other).
-    // Prioritizes the canonical entry, then retries with scriptData, as tiebreakers.
+    // Restores a branch saved by a rewind past all tracking. Everything tracked from
+    // forkTurn on belongs to the abandoned timeline, however many turns the player
+    // took there, so only entries before the fork are kept. The actions between the
+    // fork and the branch's first entry were never tracked on the branch's timeline:
+    // they are filled from the AID window where it still reaches them, and otherwise
+    // with empty placeholders, as backfillFromAidHistory does.
+    // committedCount is the count of actions AID has committed; AID's last window
+    // entry is action committedCount - 1.
+    function restoreForkedBranch(state, branch, committedCount, aidHistory) {
+      const keepTo = countToIndex(state, branch.forkTurn);
+      const kept = keepTo > 0 ? state.rvh.history.slice(0, keepTo) : [];
+    
+      const gap = [];
+      for (let count = branch.forkTurn; count < branch.firstTurn; count++) {
+        const entry = aidHistory[aidHistory.length - (committedCount - count)];
+        gap.push({ text: entry?.text ?? '', actionType: entry?.type ?? 'other', retries: [], scriptData: {} });
+      }
+    
+      state.rvh.history = kept.concat(gap, branch.history);
+      if (kept.length === 0) state.rvh.firstActionIndex = branch.forkTurn;
+    }
+    
+    // Applies a rewind or redo to RVH's history, for whichever hook discovers it
+    // (input, or context when the player pressed Continue). aidCount is
+    // info.actionCount, which AID has already pre-incremented for the pending action.
+    // Rewind trims the tracked tail into an alt branch, or clears all tracking when
+    // the rewind lands at or before the first tracked entry. Redo restores a matching
+    // alt branch, or else seeds and backfills from the AID window. Once the histories
+    // line up, resolves which retry the player kept. Leaves actionCount at the
+    // committed count; the caller adds the pending action.
+    // Returns true when a rewind cleared all tracking (capture reason 'rewind-past-tracking').
+    function applyRewindOrRedo(state, aidHistory, changeType, aidCount, dbg = null) {
+      const committedCount = aidCount - 1;
+      let rewoundPastTracking = false;
+    
+      if (changeType === 'rewind') {
+        const trimAt = countToIndex(state, committedCount);
+        if (trimAt > 0) {
+          saveAltHistory(state, committedCount, trimToIndex(state, trimAt));
+        } else {
+          const tail = state.rvh.history.splice(0);
+          if (tail.length > 0) saveAltHistory(state, state.rvh.firstActionIndex, tail, committedCount);
+          state.rvh.firstActionIndex = committedCount;
+          rewoundPastTracking = true;
+        }
+        state.rvh.actionCount = committedCount;
+      } else if (changeType === 'redo') {
+        if (!restoreAltHistory(state, committedCount, aidHistory)) {
+          // Seed first if nothing is tracked, then append the redone tail.
+          if (state.rvh.history.length === 0) captureUntrackedFromWindow(state, aidHistory, committedCount);
+          backfillFromAidHistory(state, aidHistory, committedCount);
+          state.rvh.actionCount = committedCount;
+        }
+      } else {
+        return false;
+      }
+    
+      resolveRetryWinner(state, aidHistory, dbg);
+      return rewoundPastTracking;
+    }
+    
+    // Swaps entry.retries[retryIdx] in as the entry's canonical text, actionType and
+    // scriptData; the old canonical moves to the end of retries.
+    function promoteRetry(entry, retryIdx) {
+      const promoted = entry.retries.splice(retryIdx, 1)[0];
+      entry.retries.push({ text: entry.text, actionType: entry.actionType, scriptData: entry.scriptData });
+      entry.text = promoted.text;
+      entry.actionType = promoted.actionType;
+      entry.scriptData = promoted.scriptData;
+    }
+    
+    // When the player stops retrying, AID's history reveals which response they kept
+    // (AID runs no hooks when the player flips between retries). The canonical and
+    // every retry are scored against AID's last entry; the highest score wins, with
+    // the canonical winning ties, and a winning retry is promoted. Any other candidate
+    // within AMBIGUOUS_DELTA of the winner sets rvh.ambiguous so mods can correct
+    // their scriptData.
+    // Callers must only run this when AID's last entry and rvh's last entry are the
+    // same action: after rewind/redo handling, and never on a retry turn.
     function resolveRetryWinner(state, aidHistory, dbg = null) {
       const last = state.rvh.history[state.rvh.history.length - 1];
       if (!last || last.retries.length === 0) return;
@@ -1236,67 +1317,23 @@ class RevampedHistory {
       const aidLast = aidHistory[aidHistory.length - 1];
       if (!aidLast) return;
     
-      // Score canonical and all retries
-      const canonicalSim = jaccardSimilarity(aidLast.text, last.text);
+      const candidates = [
+        { retryIdx: -1, entry: last, sim: jaccardSimilarity(aidLast.text, last.text) },
+        ...last.retries.map((r, i) => ({ retryIdx: i, entry: r, sim: jaccardSimilarity(aidLast.text, r.text) })),
+      ];
+      const winner = candidates.reduce((best, c) => c.sim > best.sim ? c : best);
+      const alts = candidates.filter(c => c !== winner && c.sim >= winner.sim - AMBIGUOUS_DELTA);
     
-      const retrySims = last.retries.map((r, i) => ({
-        index: i,
-        sim: jaccardSimilarity(aidLast.text, r.text),
-        hasScriptData: r.scriptData && Object.keys(r.scriptData).length > 0,
-      }));
-    
-      // Find the best retry score
-      const bestRetry = retrySims.reduce((best, r) => r.sim > best.sim ? r : best, retrySims[0]);
-    
-      // Canonical wins unless a retry beats it clearly
-      if (bestRetry.sim <= canonicalSim) {
-        // Canonical is best or tied — check for ambiguity among close competitors
-        const considered = retrySims.filter(r => r.sim >= bestRetry.sim - AMBIGUOUS_DELTA);
-        if (considered.length > 0 && bestRetry.sim >= canonicalSim - AMBIGUOUS_DELTA) {
-          state.rvh.ambiguous = {
-            index: state.rvh.history.length - 1,
-            chosenAction: { text: last.text, scriptData: last.scriptData },
-            consideredAlts: considered.map(r => ({
-              text: last.retries[r.index].text,
-              scriptData: last.retries[r.index].scriptData,
-            })),
-          };
-        }
-        return;
-      }
-    
-      // A retry beats canonical — find the best among close competitors,
-      // preferring retries with scriptData as tiebreaker
-      const candidates = retrySims.filter(r => r.sim >= bestRetry.sim - AMBIGUOUS_DELTA);
-      const winner = candidates.reduce((best, r) => {
-        if (r.sim > best.sim) return r;
-        if (r.sim === best.sim && r.hasScriptData && !best.hasScriptData) return r;
-        return best;
-      }, candidates[0]);
-    
-      // Flag ambiguity if canonical or other retries were close
-      const otherCandidates = [
-        { text: last.text, scriptData: last.scriptData, sim: canonicalSim },
-        ...retrySims
-          .filter(r => r.index !== winner.index && r.sim >= bestRetry.sim - AMBIGUOUS_DELTA)
-          .map(r => ({ text: last.retries[r.index].text, scriptData: last.retries[r.index].scriptData, sim: r.sim })),
-      ].filter(c => c.sim >= bestRetry.sim - AMBIGUOUS_DELTA);
-    
-      if (otherCandidates.length > 0) {
-        dbg?.error("Ambiguous Action Found");
+      if (alts.length > 0) {
+        dbg?.inform('Ambiguous retry resolution');
         state.rvh.ambiguous = {
           index: state.rvh.history.length - 1,
-          chosenAction: { text: last.retries[winner.index].text, scriptData: last.retries[winner.index].scriptData },
-          consideredAlts: otherCandidates.map(c => ({ text: c.text, scriptData: c.scriptData })),
+          chosenAction: { text: winner.entry.text, scriptData: winner.entry.scriptData },
+          consideredAlts: alts.map(c => ({ text: c.entry.text, scriptData: c.entry.scriptData })),
         };
       }
     
-      // Promote the winner
-      const promoted = last.retries.splice(winner.index, 1)[0];
-      last.retries.push({ text: last.text, actionType: last.actionType, scriptData: last.scriptData });
-      last.text = promoted.text;
-      last.actionType = promoted.actionType;
-      last.scriptData = promoted.scriptData;
+      if (winner.retryIdx !== -1) promoteRetry(last, winner.retryIdx);
     }
     
     function freshenText(state, edits) {
@@ -1328,12 +1365,7 @@ class RevampedHistory {
           }
         }
     
-        if (bestRetryIdx !== -1) {
-          const winner = entry.retries.splice(bestRetryIdx, 1)[0];
-          entry.retries.push({ text: entry.text, actionType: entry.actionType, scriptData: entry.scriptData });
-          entry.actionType = winner.actionType;
-          entry.scriptData = winner.scriptData;
-        }
+        if (bestRetryIdx !== -1) promoteRetry(entry, bestRetryIdx);
     
         entry.text = newText;
       }
@@ -1455,9 +1487,9 @@ class RevampedHistory {
         if (set2.has(b)) intersectionCount++;
       }
       const unionCount = set1.size + set2.size - intersectionCount;
-      return unionCount === 0 ? 0 : intersectionCount / unionCount;
+      return intersectionCount / unionCount;
     }
-    return { updateDebugCard, updateAidDebugCard, getOrCreateCard, getStoryCardEntryByTitle, updateHistoryDebugCards, inferActionType, findHistoryMatch, classifyStateChange, trailingContinueCount, pushAction, startEntryBonus, countToIndex, trimToIndex, saveAltHistory, restoreAltHistory, resolveRetryWinner, freshenText, backfillFromAidHistory, captureUntrackedFromWindow, rvhEnsureInit, computeBigrams, jaccardSimilarity, DEBUG_CARD_TYPE, MATCH_CONFIDENCE_RATIO, LOOKBACK_WINDOW, MAX_CONSECUTIVE_MISMATCHES, AID_HISTORY_CAP, RVH_DEBUG_DEFAULT_LEVEL, AMBIGUOUS_DELTA, SIMILARITY_THRESHOLD };
+    return { updateDebugCard, updateAidDebugCard, getOrCreateCard, getStoryCardEntryByTitle, updateHistoryDebugCards, inferActionType, findHistoryMatch, classifyStateChange, trailingContinueCount, pushAction, startEntryBonus, countToIndex, trimToIndex, saveAltHistory, restoreAltHistory, restoreForkedBranch, applyRewindOrRedo, promoteRetry, resolveRetryWinner, freshenText, backfillFromAidHistory, captureUntrackedFromWindow, rvhEnsureInit, computeBigrams, jaccardSimilarity, DEBUG_CARD_TYPE, MATCH_CONFIDENCE_RATIO, LOOKBACK_WINDOW, MAX_CONSECUTIVE_MISMATCHES, AID_HISTORY_CAP, RVH_DEBUG_DEFAULT_LEVEL, AMBIGUOUS_DELTA, SIMILARITY_THRESHOLD };
   })();
 
   static preInput(text) {
@@ -1468,43 +1500,20 @@ class RevampedHistory {
     UnifiedSettings.input(text);
     dbg.applyLevel('Input');
   
-    state.rvh.capture = null; // new turn — clear last turn's capture signal
+    state.rvh.capture   = null; // new turn — clear last turn's capture and ambiguity signals
+    state.rvh.ambiguous = null;
   
     const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
-    RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
+    // Retry winner resolution compares AID's last entry with ours, so it only runs
+    // once the two line up: here for a new action (before RevampedHistory.#lib.freshenText rewrites the
+    // text it scores against), inside RevampedHistory.#lib.applyRewindOrRedo for rewind/redo.
+    if (changeType === 'new') RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
     RevampedHistory.#lib.freshenText(state, edits);
   
     // Actions committed so far (AID pre-increments actionCount for the pending action).
     const committedCount = info.actionCount - 1;
-    let rewoundPastTracking = false;
-  
-    if (changeType === 'rewind') {
-      const divergeIdx = info.actionCount - 1; // action-count rewind target
-      const trimAt = RevampedHistory.#lib.countToIndex(state, divergeIdx);
-      if (trimAt > 0) {
-        const tail = RevampedHistory.#lib.trimToIndex(state, trimAt);
-        RevampedHistory.#lib.saveAltHistory(state, divergeIdx, tail);
-      } else {
-        // Rewound to or before the first tracked entry: the whole history goes.
-        const tail = state.rvh.history.splice(0);
-        if (tail.length > 0) RevampedHistory.#lib.saveAltHistory(state, state.rvh.firstActionIndex, tail);
-        state.rvh.firstActionIndex = divergeIdx;
-        rewoundPastTracking = true;
-      }
-      state.rvh.actionCount = divergeIdx;
-      state.rvh.actionCount++;
-    } else if (changeType === 'redo') {
-      const restored = RevampedHistory.#lib.restoreAltHistory(state, info.actionCount - 1, history);
-      if (!restored) {
-        // Seed first if nothing is tracked, then append the redone tail.
-        if (state.rvh.history.length === 0) RevampedHistory.#lib.captureUntrackedFromWindow(state, history, committedCount);
-        RevampedHistory.#lib.backfillFromAidHistory(state, history, committedCount);
-        state.rvh.actionCount = info.actionCount - 1;
-      }
-      state.rvh.actionCount++;
-    } else if (changeType === 'new') {
-      state.rvh.actionCount++;
-    }
+    const rewoundPastTracking = RevampedHistory.#lib.applyRewindOrRedo(state, history, changeType, info.actionCount, dbg);
+    if (changeType === 'new' || changeType === 'rewind' || changeType === 'redo') state.rvh.actionCount++;
   
     if (changeType !== 'start') {
       RevampedHistory.#lib.captureUntrackedFromWindow(state, history, committedCount,
@@ -1522,6 +1531,7 @@ class RevampedHistory {
   static popRetryAiEntry(state) {
     const popped = state.rvh.history.pop();
     state.rvh.aiAction = {
+      changeType: 'retry',
       actionType: popped.actionType,
       text:       null,
       scriptData: {},
@@ -1540,6 +1550,7 @@ class RevampedHistory {
     state.rvh.aiAction = { actionType: 'continue', text: null, scriptData: {} };
   
     if (state.rvh.playerAction) {
+      state.rvh.aiAction.changeType = state.rvh.playerAction.changeType;
       if (state.rvh.playerAction.changeType !== 'retry') {
         dbg.inform("Player Action");
         state.rvh.actionCount++;
@@ -1547,8 +1558,9 @@ class RevampedHistory {
         RevampedHistory.popRetryAiEntry(state);
       }
     } else {
-      // Input hook didn't run this turn, so any capture signal is stale.
-      state.rvh.capture = null;
+      // Input hook didn't run this turn, so any capture or ambiguity signal is stale.
+      state.rvh.capture   = null;
+      state.rvh.ambiguous = null;
   
       const aidCount = info.actionCount;
       const rvhCount = state.rvh.actionCount;
@@ -1557,35 +1569,13 @@ class RevampedHistory {
       const committedCount = aidCount - 1;
       let rewoundPastTracking = false;
   
-     if (aidCount < rvhCount || aidCount > rvhCount + 1) {
+      if (aidCount < rvhCount || aidCount > rvhCount + 1) {
+        // Counts alone say rewind or redo here; RevampedHistory.#lib.applyRewindOrRedo resolves the
+        // retry winner once the history surgery has lined our last entry up with AID's.
         const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
-        RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
         RevampedHistory.#lib.freshenText(state, edits);
         state.rvh.aiAction.changeType = changeType;
-  
-        if (changeType === 'rewind') {
-          const divergeIdx = aidCount - 1; // action-count rewind target
-          const trimAt = RevampedHistory.#lib.countToIndex(state, divergeIdx);
-          if (trimAt > 0) {
-            const tail = RevampedHistory.#lib.trimToIndex(state, trimAt);
-            RevampedHistory.#lib.saveAltHistory(state, divergeIdx, tail);
-          } else {
-            // Rewound to or before the first tracked entry: the whole history goes.
-            const tail = state.rvh.history.splice(0);
-            if (tail.length > 0) RevampedHistory.#lib.saveAltHistory(state, state.rvh.firstActionIndex, tail);
-            state.rvh.firstActionIndex = divergeIdx;
-            rewoundPastTracking = true;
-          }
-          state.rvh.actionCount = divergeIdx;
-        } else if (changeType === 'redo') {
-          const restored = RevampedHistory.#lib.restoreAltHistory(state, aidCount - 1, history);
-          if (!restored) {
-            // Seed first if nothing is tracked, then append the redone tail.
-            if (state.rvh.history.length === 0) RevampedHistory.#lib.captureUntrackedFromWindow(state, history, committedCount);
-            RevampedHistory.#lib.backfillFromAidHistory(state, history, committedCount);
-            state.rvh.actionCount = aidCount - 1;
-          }
-        }
+        rewoundPastTracking = RevampedHistory.#lib.applyRewindOrRedo(state, history, changeType, aidCount, dbg);
         state.rvh.actionCount++;
       } else {
         let aidTrailing = 0;
@@ -1598,7 +1588,7 @@ class RevampedHistory {
           state.rvh.playerAction = { changeType: 'retry', actionType: 'continue', text: null, scriptData: {} };
         } else {
           const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
-          RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
+          if (changeType === 'new') RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
           RevampedHistory.#lib.freshenText(state, edits);
           state.rvh.aiAction.changeType = changeType;
           state.rvh.actionCount++;

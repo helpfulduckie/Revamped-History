@@ -1,8 +1,8 @@
 // ===========================================================
-// ===== RevampedHistory (ready to use) - 1.4.0 - output =====
+// ===== RevampedHistory (ready to use) - 1.5.0 - output =====
 // ===========================================================
 // - UnifiedSettings@1.1.2
-// - RevampedHistory@1.4.0
+// - RevampedHistory@1.5.0
 // ===========================================================
 // Paste this ONLY into the output tab in AI Dungeon scripting
 // ===========================================================
