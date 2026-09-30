@@ -1,7 +1,7 @@
 // ============================================================
-// ============= RevampedHistory - 1.2.2 - library ============
+// ============= RevampedHistory - 1.4.0 - library ============
 // ============================================================
-// - RevampedHistory@1.2.2
+// - RevampedHistory@1.4.0
 // ============================================================
 // Paste this ONLY into the library tab in AI Dungeon scripting
 // ============================================================
@@ -42,7 +42,6 @@ class RevampedHistory {
         }
       )
     }
-    
     
     function updateAidDebugCard() {
       if (!history) return;
@@ -87,14 +86,12 @@ class RevampedHistory {
       return card ? card : null;
     }
     
-    
-    function updateHistoryDebugCards() {
-      if (DuckieDebug.getLevel() > DuckieDebug.duckieDebugMode.OFF) {
+    function updateHistoryDebugCards(dbg) {
+      if (dbg.getLevel() > DuckieDebug.duckieDebugMode.OFF) {
         updateDebugCard();
         updateAidDebugCard();
       }
     }
-    
     
     
     
@@ -182,19 +179,46 @@ class RevampedHistory {
     
     
     
+    // =========================================
+    // constants - Build-overridable constants for RevampedHistory.
+    // Declared at file scope so patchwork-press fileOverrides can rewrite them
+    // per bundle; see WTG's src/core/constants.js for the same pattern.
+    // =========================================
+    
+    // Debug verbosity RVH's own DuckieDebug instance starts at: 0 OFF / 1 ERROR / 2 INFORM.
+    // Defaults to OFF so a mod-agnostic dependency never writes debug story cards into a
+    // player's scenario uninvited. Bundles that want RVH's logs override this to 1 or 2.
+    // Numeric, not a string: DuckieDebug's applyLevel() treats a non-number as a boolean,
+    // and the string '0' is truthy — which would read as level 2.
+    const RVH_DEBUG_DEFAULT_LEVEL = 0;
+    
+    
+    
     // --- history ops ---
-    
-    
     
     const AMBIGUOUS_DELTA = 0.20;
     
-    function pushAction(state, text, actionType, scriptData = {}) {
-      state.rvh.history.push({ text, actionType, retries: [], scriptData });
+    function pushAction(state, text, actionType, scriptData = {}, retries = []) {
+      state.rvh.history.push({ text, actionType, retries, scriptData });
       if (state.rvh.history.length > state.rvh.historyMaxLength) {
-        state.rvh.history.shift();
+        const evicted = state.rvh.history.shift();
+        // The start turn commits two entries under a single action count (see
+        // startEntryBonus); evicting the start entry itself costs no counts.
+        if (evicted.actionType !== 'start') state.rvh.firstActionIndex++;
       }
     }
     
+    // The game-start turn produces two history entries (the start action and the
+    // first AI response) but only one actionCount tick. While the start entry is
+    // still at the base of rvh.history, count→index conversion is shifted by one.
+    function startEntryBonus(state) {
+      return state.rvh.history[0]?.actionType === 'start' ? 1 : 0;
+    }
+    
+    // Convert an action-count index into an array index of state.rvh.history.
+    function countToIndex(state, count) {
+      return count - state.rvh.firstActionIndex + startEntryBonus(state);
+    }
     
     function trimToIndex(state, index) {
       return state.rvh.history.splice(index);
@@ -224,7 +248,11 @@ class RevampedHistory {
     
       if (!bestBranch) return false;
     
-      state.rvh.history = state.rvh.history.slice(0, bestBranch.firstTurn).concat(bestBranch.history);
+      // firstTurn is an action count; convert to an array index via the offset.
+      const attachAt = countToIndex(state, bestBranch.firstTurn);
+      if (attachAt < 0) return false; // branch predates the tracked range; cannot reattach
+    
+      state.rvh.history = state.rvh.history.slice(0, attachAt).concat(bestBranch.history);
       state.rvh.actionCount = bestBranch.firstTurn + bestBranch.history.length;
       state.rvh.altHistory = state.rvh.altHistory.filter(b => b !== bestBranch);
       return true;
@@ -234,7 +262,7 @@ class RevampedHistory {
     // If it matches a stored retry rather than the current winner, swap it in.
     // Sets rvh.ambiguous if the match is low-confidence (scores within AMBIGUOUS_DELTA of each other).
     // Prioritizes the canonical entry, then retries with scriptData, as tiebreakers.
-    function resolveRetryWinner(state, aidHistory) {
+    function resolveRetryWinner(state, aidHistory, dbg = null) {
       const last = state.rvh.history[state.rvh.history.length - 1];
       if (!last || last.retries.length === 0) return;
     
@@ -288,7 +316,7 @@ class RevampedHistory {
       ].filter(c => c.sim >= bestRetry.sim - AMBIGUOUS_DELTA);
     
       if (otherCandidates.length > 0) {
-        DuckieDebug.duckieDebug("Ambiguous Action Found", DuckieDebug.duckieDebugMode.ERROR);
+        dbg?.error("Ambiguous Action Found");
         state.rvh.ambiguous = {
           index: state.rvh.history.length - 1,
           chosenAction: { text: last.retries[winner.index].text, scriptData: last.retries[winner.index].scriptData },
@@ -344,11 +372,67 @@ class RevampedHistory {
       }
     }
     
-    function backfillFromAidHistory(state, aidHistory, fromIdx) {
-      for (let i = fromIdx; i < aidHistory.length; i++) {
-        const entry = aidHistory[i];
-        if (entry) pushAction(state, entry.text, entry.type, {});
+    // Appends actions committed in AID but missing from the tracked tail (redo
+    // beyond any saved branch). The count of missing actions is derived from the
+    // at-rest invariant committedCount === firstActionIndex + length - startBonus;
+    // entries that already fell out of the AID window get an empty placeholder so
+    // count alignment holds.
+    function backfillFromAidHistory(state, aidHistory, committedCount) {
+      if (state.rvh.history.length === 0) {
+        // Nothing tracked: alignment is the window start (capture normally seeds
+        // before backfill runs, so this is a fallback for an empty window).
+        state.rvh.firstActionIndex = Math.max(0, committedCount - aidHistory.length);
       }
+      const tracked = state.rvh.firstActionIndex + state.rvh.history.length - startEntryBonus(state);
+      const missing = committedCount - tracked;
+      if (missing <= 0) return;
+    
+      for (let j = aidHistory.length - missing; j < aidHistory.length; j++) {
+        const entry = j >= 0 ? aidHistory[j] : null;
+        if (entry) pushAction(state, entry.text, entry.type, {});
+        else pushAction(state, '', 'other', {});
+      }
+    }
+    
+    // Captures AID-window entries that predate tracking: seeds an empty history
+    // (mid-story install, state loss, rewind past tracking) and prepends older
+    // entries the window reveals in front of tracking (window refill after a deep
+    // rewind). Sizing is content-free — the window's tail is assumed to be the
+    // entries we already track (phaseAdjust corrects for entries AID holds or has
+    // popped that we haven't committed yet); anything beyond that at the front is
+    // untracked. Sets state.rvh.capture so other mods can seed their own
+    // scriptData over the captured range. Does not touch actionCount — counter
+    // choreography stays with the hooks.
+    function captureUntrackedFromWindow(state, aidHistory, committedCount, phaseAdjust = 0, reason) {
+      if (committedCount <= 0 || aidHistory.length === 0) return;
+    
+      const ourLen = state.rvh.history.length;
+      const extra  = aidHistory.length - (ourLen + phaseAdjust);
+      if (extra <= 0) return;
+    
+      // Clamp to the cap: only capture what fits in front, preferring the newest.
+      const take = Math.min(extra, state.rvh.historyMaxLength - ourLen);
+      if (take <= 0) return;
+    
+      const captured = [];
+      for (let j = extra - take; j < extra; j++) {
+        const entry = aidHistory[j];
+        captured.push({ text: entry?.text || '', actionType: entry?.type || 'other', retries: [], scriptData: {} });
+      }
+      // If the window still reaches back to the very start of the adventure, the
+      // start entry rides along and contributes no action count (see startEntryBonus).
+      const capturedBonus = captured[0].actionType === 'start' ? 1 : 0;
+    
+      state.rvh.history.unshift(...captured);
+      state.rvh.firstActionIndex = ourLen === 0
+        ? Math.max(0, committedCount - take + capturedBonus)
+        : Math.max(0, state.rvh.firstActionIndex - take + capturedBonus);
+    
+      state.rvh.capture = {
+        count:           take,
+        fromActionIndex: state.rvh.firstActionIndex,
+        reason:          reason || (ourLen === 0 ? 'seed' : 'prepend'),
+      };
     }
     
     
@@ -356,10 +440,20 @@ class RevampedHistory {
     // --- init ---
     
     function rvhEnsureInit(state) {
-      if (state.rvh) return;
+      if (state.rvh) {
+        if (state.rvh.firstActionIndex === undefined) {
+          // Session predates firstActionIndex. At rest (between turns) the invariant
+          // actionCount === firstActionIndex + history.length - startEntryBonus holds
+          // (the start turn commits two entries under one count), so derive it.
+          const bonus = state.rvh.history[0]?.actionType === 'start' ? 1 : 0;
+          state.rvh.firstActionIndex = Math.max(0, state.rvh.actionCount - (state.rvh.history.length - bonus));
+        }
+        return;
+      }
       state.rvh = {
         history: [],
         actionCount: 0,
+        firstActionIndex: 0,
         historyMaxLength: 1000,
         altHistory: [],
         maxAltHistories: 5,
@@ -396,29 +490,59 @@ class RevampedHistory {
       const unionCount = set1.size + set2.size - intersectionCount;
       return unionCount === 0 ? 0 : intersectionCount / unionCount;
     }
-    return { updateDebugCard, updateAidDebugCard, getOrCreateCard, getStoryCardEntryByTitle, updateHistoryDebugCards, inferActionType, findHistoryMatch, classifyStateChange, trailingContinueCount, pushAction, trimToIndex, saveAltHistory, restoreAltHistory, resolveRetryWinner, freshenText, backfillFromAidHistory, rvhEnsureInit, computeBigrams, jaccardSimilarity, DEBUG_CARD_TYPE, MATCH_CONFIDENCE_RATIO, LOOKBACK_WINDOW, MAX_CONSECUTIVE_MISMATCHES, AID_HISTORY_CAP, AMBIGUOUS_DELTA, SIMILARITY_THRESHOLD };
+    return { updateDebugCard, updateAidDebugCard, getOrCreateCard, getStoryCardEntryByTitle, updateHistoryDebugCards, inferActionType, findHistoryMatch, classifyStateChange, trailingContinueCount, pushAction, startEntryBonus, countToIndex, trimToIndex, saveAltHistory, restoreAltHistory, resolveRetryWinner, freshenText, backfillFromAidHistory, captureUntrackedFromWindow, rvhEnsureInit, computeBigrams, jaccardSimilarity, DEBUG_CARD_TYPE, MATCH_CONFIDENCE_RATIO, LOOKBACK_WINDOW, MAX_CONSECUTIVE_MISMATCHES, AID_HISTORY_CAP, RVH_DEBUG_DEFAULT_LEVEL, AMBIGUOUS_DELTA, SIMILARITY_THRESHOLD };
   })();
 
   static preInput(text) {
     RevampedHistory.#lib.rvhEnsureInit(state);
+  
+    const dbg = new DuckieDebug({ modName: 'RevampedHistory', defaultLevel: RevampedHistory.#lib.RVH_DEBUG_DEFAULT_LEVEL });
+    dbg.preHook();
+    UnifiedSettings.input(text);
+    dbg.applyLevel('Input');
+  
+    state.rvh.capture = null; // new turn — clear last turn's capture signal
+  
     const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
-    RevampedHistory.#lib.resolveRetryWinner(state, history);
+    RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
     RevampedHistory.#lib.freshenText(state, edits);
   
+    // Actions committed so far (AID pre-increments actionCount for the pending action).
+    const committedCount = info.actionCount - 1;
+    let rewoundPastTracking = false;
+  
     if (changeType === 'rewind') {
-      const divergeIdx = info.actionCount - 1;
-      const tail = RevampedHistory.#lib.trimToIndex(state, divergeIdx);
-      RevampedHistory.#lib.saveAltHistory(state, divergeIdx, tail);
+      const divergeIdx = info.actionCount - 1; // action-count rewind target
+      const trimAt = RevampedHistory.#lib.countToIndex(state, divergeIdx);
+      if (trimAt > 0) {
+        const tail = RevampedHistory.#lib.trimToIndex(state, trimAt);
+        RevampedHistory.#lib.saveAltHistory(state, divergeIdx, tail);
+      } else {
+        // Rewound to or before the first tracked entry: the whole history goes.
+        const tail = state.rvh.history.splice(0);
+        if (tail.length > 0) RevampedHistory.#lib.saveAltHistory(state, state.rvh.firstActionIndex, tail);
+        state.rvh.firstActionIndex = divergeIdx;
+        rewoundPastTracking = true;
+      }
       state.rvh.actionCount = divergeIdx;
       state.rvh.actionCount++;
     } else if (changeType === 'redo') {
       const restored = RevampedHistory.#lib.restoreAltHistory(state, info.actionCount - 1, history);
       if (!restored) {
+        // Seed first if nothing is tracked, then append the redone tail.
+        if (state.rvh.history.length === 0) RevampedHistory.#lib.captureUntrackedFromWindow(state, history, committedCount);
+        RevampedHistory.#lib.backfillFromAidHistory(state, history, committedCount);
         state.rvh.actionCount = info.actionCount - 1;
       }
       state.rvh.actionCount++;
     } else if (changeType === 'new') {
       state.rvh.actionCount++;
+    }
+  
+    if (changeType !== 'start') {
+      RevampedHistory.#lib.captureUntrackedFromWindow(state, history, committedCount,
+        changeType === 'retry' ? -1 : 0,
+        rewoundPastTracking ? 'rewind-past-tracking' : undefined);
     }
   
     let actionType = RevampedHistory.#lib.inferActionType(text);
@@ -440,35 +564,58 @@ class RevampedHistory {
 
   static preContext(text) {
     RevampedHistory.#lib.rvhEnsureInit(state);
+  
+    const dbg = new DuckieDebug({ modName: 'RevampedHistory', defaultLevel: RevampedHistory.#lib.RVH_DEBUG_DEFAULT_LEVEL });
+    dbg.preHook();
+    UnifiedSettings.context(text);
+    dbg.applyLevel('Context');
+  
     state.rvh.aiAction = { actionType: 'continue', text: null, scriptData: {} };
   
     if (state.rvh.playerAction) {
       if (state.rvh.playerAction.changeType !== 'retry') {
-        DuckieDebug.duckieDebug("Player Action", 2);
+        dbg.inform("Player Action");
         state.rvh.actionCount++;
       } else {
         RevampedHistory.popRetryAiEntry(state);
       }
     } else {
+      // Input hook didn't run this turn, so any capture signal is stale.
+      state.rvh.capture = null;
   
       const aidCount = info.actionCount;
       const rvhCount = state.rvh.actionCount;
   
+      // Actions committed so far (AID pre-increments actionCount for the pending action).
+      const committedCount = aidCount - 1;
+      let rewoundPastTracking = false;
+  
      if (aidCount < rvhCount || aidCount > rvhCount + 1) {
         const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
-        RevampedHistory.#lib.resolveRetryWinner(state, history);
+        RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
         RevampedHistory.#lib.freshenText(state, edits);
         state.rvh.aiAction.changeType = changeType;
   
         if (changeType === 'rewind') {
-          const divergeIdx = aidCount - 1;
-          const tail = RevampedHistory.#lib.trimToIndex(state, divergeIdx);
-          RevampedHistory.#lib.saveAltHistory(state, divergeIdx, tail);
+          const divergeIdx = aidCount - 1; // action-count rewind target
+          const trimAt = RevampedHistory.#lib.countToIndex(state, divergeIdx);
+          if (trimAt > 0) {
+            const tail = RevampedHistory.#lib.trimToIndex(state, trimAt);
+            RevampedHistory.#lib.saveAltHistory(state, divergeIdx, tail);
+          } else {
+            // Rewound to or before the first tracked entry: the whole history goes.
+            const tail = state.rvh.history.splice(0);
+            if (tail.length > 0) RevampedHistory.#lib.saveAltHistory(state, state.rvh.firstActionIndex, tail);
+            state.rvh.firstActionIndex = divergeIdx;
+            rewoundPastTracking = true;
+          }
           state.rvh.actionCount = divergeIdx;
         } else if (changeType === 'redo') {
           const restored = RevampedHistory.#lib.restoreAltHistory(state, aidCount - 1, history);
           if (!restored) {
-            RevampedHistory.#lib.backfillFromAidHistory(state, history, state.rvh.history.length);
+            // Seed first if nothing is tracked, then append the redone tail.
+            if (state.rvh.history.length === 0) RevampedHistory.#lib.captureUntrackedFromWindow(state, history, committedCount);
+            RevampedHistory.#lib.backfillFromAidHistory(state, history, committedCount);
             state.rvh.actionCount = aidCount - 1;
           }
         }
@@ -484,12 +631,15 @@ class RevampedHistory {
           state.rvh.playerAction = { changeType: 'retry', actionType: 'continue', text: null, scriptData: {} };
         } else {
           const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
-          RevampedHistory.#lib.resolveRetryWinner(state, history);
+          RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
           RevampedHistory.#lib.freshenText(state, edits);
           state.rvh.aiAction.changeType = changeType;
           state.rvh.actionCount++;
         }
       }
+  
+      RevampedHistory.#lib.captureUntrackedFromWindow(state, history, committedCount, 0,
+        rewoundPastTracking ? 'rewind-past-tracking' : undefined);
     }
   }
 
@@ -499,24 +649,30 @@ class RevampedHistory {
 
   static postOutput(text) {
     RevampedHistory.#lib.rvhEnsureInit(state);
+  
+    const dbg = new DuckieDebug({ modName: 'RevampedHistory', defaultLevel: RevampedHistory.#lib.RVH_DEBUG_DEFAULT_LEVEL });
+    dbg.preHook();
+    UnifiedSettings.output(text);
+    dbg.applyLevel('Output');
+  
     const playerAction = state.rvh.playerAction;
     const aiAction     = state.rvh.aiAction;
   
     if (!playerAction) {
       if (aiAction) {
         aiAction.text = text;
-        RevampedHistory.#lib.pushAction(state, aiAction.text, aiAction.actionType, aiAction.scriptData);
+        RevampedHistory.#lib.pushAction(state, aiAction.text, aiAction.actionType, aiAction.scriptData, aiAction.retries || []);
         state.rvh.aiAction = null;
       }
       state.rvh.ambiguous = null;
+      state.rvh.capture   = null;
       state.rvh.expectedAidContinueDepth = Math.min(RevampedHistory.#lib.trailingContinueCount(history) + 1, RevampedHistory.#lib.AID_HISTORY_CAP);
-      RevampedHistory.#lib.updateHistoryDebugCards();
+      RevampedHistory.#lib.updateHistoryDebugCards(dbg);
     } else {
       aiAction.text = text;
   
       if (playerAction.changeType === 'retry') {
-        state.rvh.history.push({ text: aiAction.text, actionType: aiAction.actionType, scriptData: aiAction.scriptData, retries: aiAction.retries });
-        if (state.rvh.history.length > state.rvh.historyMaxLength) state.rvh.history.shift();
+        RevampedHistory.#lib.pushAction(state, aiAction.text, aiAction.actionType, aiAction.scriptData, aiAction.retries);
       } else {
         const lastEntry = history[history.length - 1];
         if (lastEntry && lastEntry.type && lastEntry.type !== playerAction.actionType) {
@@ -529,9 +685,10 @@ class RevampedHistory {
       state.rvh.playerAction = null;
       state.rvh.aiAction     = null;
       state.rvh.ambiguous    = null;
+      state.rvh.capture      = null;
   
       state.rvh.expectedAidContinueDepth = Math.min(RevampedHistory.#lib.trailingContinueCount(history) + 1, RevampedHistory.#lib.AID_HISTORY_CAP);
-      RevampedHistory.#lib.updateHistoryDebugCards();
+      RevampedHistory.#lib.updateHistoryDebugCards(dbg);
     }
   }
 
@@ -585,12 +742,34 @@ class RevampedHistory {
     return key !== undefined ? entry.scriptData[namespace]?.[key] : entry.scriptData[namespace];
   }
 
+  static setScriptDataAt(index, namespace, key, value) {
+    if (namespace === '__proto__' || namespace === 'constructor' || namespace === 'prototype') return false;
+    const hist = state.rvh?.history;
+    if (!hist) return false;
+    const resolved = index < 0 ? hist.length + index : index;
+    const entry = hist[resolved];
+    if (!entry) return false;
+    if (!entry.scriptData) entry.scriptData = {};
+    if (!Object.prototype.hasOwnProperty.call(entry.scriptData, namespace)) entry.scriptData[namespace] = Object.create(null);
+    entry.scriptData[namespace][key] = value;
+    return true;
+  }
+
   static getHistoryLength() {
     return state.rvh?.history?.length ?? 0;
   }
 
   static getActionCount() {
     return state.rvh?.actionCount ?? 0;
+  }
+
+  static getFirstActionIndex() {
+    return state.rvh?.firstActionIndex ?? 0;
+  }
+
+  static getCaptureInfo() {
+    const c = state.rvh?.capture;
+    return c ? { count: c.count, fromActionIndex: c.fromActionIndex, reason: c.reason } : null;
   }
 
   static _entrySnapshot(e) {

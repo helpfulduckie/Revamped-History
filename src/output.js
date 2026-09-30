@@ -1,16 +1,15 @@
 // ===========================================================
-// ============= RevampedHistory - 1.2.2 - output ============
+// ============= RevampedHistory - 1.4.0 - output ============
 // ===========================================================
-// - RevampedHistory@1.2.2
+// - RevampedHistory@1.4.0
 // ===========================================================
 // Paste this ONLY into the output tab in AI Dungeon scripting
 // ===========================================================
 
 const modifier = (text) => {
-  // Be sure to add DuckieDebug.preInput(text) to this area or RevampedHistory will not work!
+  // RevampedHistory wires its own UnifiedSettings/DuckieDebug calls internally — nothing required here for RevampedHistory itself.
 
-  // Be sure to add UnifiedSettings.input(text) and DuckieDebug.input(text) to this area or RevampedHistory will not work!
-  // Your other modifier scripts also go here
+  // Your other modifier scripts go here. If they use UnifiedSettings or DuckieDebug, wire those calls into their own code the same way RevampedHistory does — do not rely on this comment block.
 
   RevampedHistory.postOutput(text);
 
