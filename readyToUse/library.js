@@ -1,9 +1,9 @@
 // ============================================================
-// ===== RevampedHistory (ready to use) - 1.5.0 - library =====
+// ===== RevampedHistory (ready to use) - 2.0.0 - library =====
 // ============================================================
 // - UnifiedSettings@1.1.2
 // - DuckieDebug@2.0.0
-// - RevampedHistory@1.5.0
+// - RevampedHistory@2.0.0
 // ============================================================
 // Paste this ONLY into the library tab in AI Dungeon scripting
 // ============================================================
@@ -977,6 +977,13 @@ class RevampedHistory {
   static #lib = (() => {
     const DEBUG_CARD_TYPE = 'zz_Debug';
     
+    // RVH's DuckieDebug instance. Instances last one hook run, so each hook phase
+    // makes its own: the pre phase registers the setting, the body/post phase
+    // applies the level.
+    function rvhDebug() {
+      return new DuckieDebug({ modName: 'RevampedHistory', defaultLevel: RVH_DEBUG_DEFAULT_LEVEL });
+    }
+    
     function updateDebugCard() {
       const rvhHistory = state.rvh?.history;
       if (!rvhHistory) return;
@@ -1489,15 +1496,13 @@ class RevampedHistory {
       const unionCount = set1.size + set2.size - intersectionCount;
       return intersectionCount / unionCount;
     }
-    return { updateDebugCard, updateAidDebugCard, getOrCreateCard, getStoryCardEntryByTitle, updateHistoryDebugCards, inferActionType, findHistoryMatch, classifyStateChange, trailingContinueCount, pushAction, startEntryBonus, countToIndex, trimToIndex, saveAltHistory, restoreAltHistory, restoreForkedBranch, applyRewindOrRedo, promoteRetry, resolveRetryWinner, freshenText, backfillFromAidHistory, captureUntrackedFromWindow, rvhEnsureInit, computeBigrams, jaccardSimilarity, DEBUG_CARD_TYPE, MATCH_CONFIDENCE_RATIO, LOOKBACK_WINDOW, MAX_CONSECUTIVE_MISMATCHES, AID_HISTORY_CAP, RVH_DEBUG_DEFAULT_LEVEL, AMBIGUOUS_DELTA, SIMILARITY_THRESHOLD };
+    return { rvhDebug, updateDebugCard, updateAidDebugCard, getOrCreateCard, getStoryCardEntryByTitle, updateHistoryDebugCards, inferActionType, findHistoryMatch, classifyStateChange, trailingContinueCount, pushAction, startEntryBonus, countToIndex, trimToIndex, saveAltHistory, restoreAltHistory, restoreForkedBranch, applyRewindOrRedo, promoteRetry, resolveRetryWinner, freshenText, backfillFromAidHistory, captureUntrackedFromWindow, rvhEnsureInit, computeBigrams, jaccardSimilarity, DEBUG_CARD_TYPE, MATCH_CONFIDENCE_RATIO, LOOKBACK_WINDOW, MAX_CONSECUTIVE_MISMATCHES, AID_HISTORY_CAP, RVH_DEBUG_DEFAULT_LEVEL, AMBIGUOUS_DELTA, SIMILARITY_THRESHOLD };
   })();
 
-  static preInput(text) {
+  static input(text) {
     RevampedHistory.#lib.rvhEnsureInit(state);
   
-    const dbg = new DuckieDebug({ modName: 'RevampedHistory', defaultLevel: RevampedHistory.#lib.RVH_DEBUG_DEFAULT_LEVEL });
-    dbg.preHook();
-    UnifiedSettings.input(text);
+    const dbg = RevampedHistory.#lib.rvhDebug();
     dbg.applyLevel('Input');
   
     state.rvh.capture   = null; // new turn — clear last turn's capture and ambiguity signals
@@ -1526,6 +1531,8 @@ class RevampedHistory {
       actionType = 'start';
     }
     state.rvh.playerAction = { changeType, actionType, text, scriptData: {} };
+  
+    return { text };
   }
 
   static popRetryAiEntry(state) {
@@ -1539,12 +1546,10 @@ class RevampedHistory {
     };
   }
 
-  static preContext(text) {
+  static context(text) {
     RevampedHistory.#lib.rvhEnsureInit(state);
   
-    const dbg = new DuckieDebug({ modName: 'RevampedHistory', defaultLevel: RevampedHistory.#lib.RVH_DEBUG_DEFAULT_LEVEL });
-    dbg.preHook();
-    UnifiedSettings.context(text);
+    const dbg = RevampedHistory.#lib.rvhDebug();
     dbg.applyLevel('Context');
   
     state.rvh.aiAction = { actionType: 'continue', text: null, scriptData: {} };
@@ -1598,6 +1603,20 @@ class RevampedHistory {
       RevampedHistory.#lib.captureUntrackedFromWindow(state, history, committedCount, 0,
         rewoundPastTracking ? 'rewind-past-tracking' : undefined);
     }
+  
+    return { text };
+  }
+
+  static preInput(_text) {
+    RevampedHistory.#lib.rvhDebug().preHook();
+  }
+
+  static preContext(_text) {
+    RevampedHistory.#lib.rvhDebug().preHook();
+  }
+
+  static preOutput(_text) {
+    RevampedHistory.#lib.rvhDebug().preHook();
   }
 
   static postInput(text) {
@@ -1607,9 +1626,7 @@ class RevampedHistory {
   static postOutput(text) {
     RevampedHistory.#lib.rvhEnsureInit(state);
   
-    const dbg = new DuckieDebug({ modName: 'RevampedHistory', defaultLevel: RevampedHistory.#lib.RVH_DEBUG_DEFAULT_LEVEL });
-    dbg.preHook();
-    UnifiedSettings.output(text);
+    const dbg = RevampedHistory.#lib.rvhDebug();
     dbg.applyLevel('Output');
   
     const playerAction = state.rvh.playerAction;

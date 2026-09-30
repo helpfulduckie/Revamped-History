@@ -1,14 +1,16 @@
 // ===========================================================
-// ===== RevampedHistory (ready to use) - 1.5.0 - output =====
+// ===== RevampedHistory (ready to use) - 2.0.0 - output =====
 // ===========================================================
 // - UnifiedSettings@1.1.2
-// - RevampedHistory@1.5.0
+// - RevampedHistory@2.0.0
 // ===========================================================
 // Paste this ONLY into the output tab in AI Dungeon scripting
 // ===========================================================
 
 const modifier = (text) => {
-  // Your modifier scripts that do not depend on UnifiedSettings or DuckieDebug can go here
+  RevampedHistory.preOutput(text);
+
+  // Your modifier scripts that do not use UnifiedSettings or RevampedHistory can go here
 
   text = UnifiedSettings.output(text).text;
 
