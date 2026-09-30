@@ -46,18 +46,19 @@ AID changes `info.actionCount` at fixed points in the turn, between the hooks. T
 | The player... | Hooks that run | Before `onInput` | Before `onModelContext` | After `onOutput` | Net |
 |---|---|---|---|---|---|
 | Starts the adventure | input, context, output | — | — | **+1** | `+1` |
-| Types a Do, Say or Story | input, context, output | **+1** | **+1** | — | `+2` |
+| Types a Do, Say or Story | input, context, output | **+1** | — | **+1** | `+2` |
 | Presses Continue | context, output | (no `onInput`) | **+1** | — | `+1` |
 | Presses Retry | context, output | (no `onInput`) | **+1** | **−1** | `0` |
 | Flips between retried responses | none | | | | `0` |
 | Undoes or rewinds | none | | | | `−1` per action removed |
 | Redoes | none | | | | `+1` per action restored |
 
-So during a typed turn's hooks the count reads `N + 1` in `onInput` and `N + 2` in `onModelContext` and `onOutput`; during a Continue's or a retry's, it reads `N + 1`. The start turn is the odd one out: every hook reads `0`, and the one increment comes after `onOutput`, even though the opening and the first response are two entries.
+So every hook of a typed turn, a Continue or a retry reads `N + 1`; a typed turn's second increment comes after `onOutput`. The start turn reads `0` in every hook and gains only one, after `onOutput`, even though the opening and the first response are two entries.
 
 The rows that trip people up:
 
-- **A retry adds one before `onModelContext` and takes it back after `onOutput`.** AID removes the retried response without changing the count, adds one for the new response as it would for any response, and then subtracts one once `onOutput` returns. So while a retry's hooks run, the count reads exactly what a new Continue's would. Inside `onModelContext` and `onOutput` there's no way to tell the two apart from `info.actionCount`, and a script that remembers the count it saw during a retry reads the same number again in `onInput` on the next typed turn, as if no action had happened.
+- **A retry adds one before `onModelContext` and takes it back after `onOutput`.** AID removes the retried response without changing the count, adds one before `onModelContext` as it does for a Continue, and then subtracts one once `onOutput` returns. So while a retry's hooks run, the count reads exactly what a new Continue's would. Inside `onModelContext` and `onOutput` there's no way to tell the two apart from `info.actionCount`, and a script that remembers the count it saw during a retry reads the same number again in `onInput` on the next typed turn, as if no action had happened.
+- **A typed turn's second increment comes after `onOutput`, not before `onModelContext`.** So `onModelContext` reads `N + 1` on a typed turn just as it does on a Continue, and the count can't tell you which one it's handling. Whether `onInput` ran this turn can.
 - **A retry never runs `onInput`,** even when the response being retried answered a typed action. The player's action isn't re-entered; only the response is regenerated.
 - **Undo, rewind, redo and flipping between retries run no hooks at all.** A script only finds out on the next turn that does run hooks, by which point the count has already moved.
 
@@ -67,21 +68,19 @@ AID adds the new entries to `history` partway through the turn, not at the start
 
 | The player... | During `onInput` | During `onModelContext` | During `onOutput` |
 |---|---|---|---|
-| Starts the adventure | empty | see below | the opening, but not the first response |
-| Types a Do, Say or Story | not yet the typed action | see below | the typed action, but not the response |
+| Starts the adventure | empty | the opening, as the last entry | the opening, but not the first response |
+| Types a Do, Say or Story | not yet the typed action | the typed action, as the last entry | the typed action, but not the response |
 | Presses Continue | (doesn't run) | not yet the response | not yet the response |
 | Presses Retry | (doesn't run) | the retried response is already gone | the retried response is already gone; not yet the new one |
 
-The response being generated is never in `history` during its own hooks. AID adds it after `onOutput` returns, with whatever text `onOutput` returned. A typed action is likewise recorded with the text `onInput` returned.
-
-**Whether the typed action (or the opening) is already in `history` during `onModelContext` is unsettled.** Some recent live measurements found it there, as the last entry; the long-standing understanding, which RVH's test environment follows, is that it arrives after `onModelContext`. Don't write context-hook code that depends on either answer: check the last entry's `type` rather than assuming what it is.
+The response being generated is never in `history` during its own hooks. AID adds it after `onOutput` returns, with whatever text `onOutput` returned. A typed action is added between `onInput` and `onModelContext`, with the text `onInput` returned.
 
 ### What RVH adds
 
 RVH reads the same signals at the start of each turn and turns them into something steadier:
 
-- **A classification for every turn,** from `getCurrentChangeType()`: `'start'`, `'new'`, `'retry'`, `'rewind'` or `'redo'`. RVH works this out in `RevampedHistory.input` on a typed turn, and in `RevampedHistory.context` on a Continue or retry, since `onInput` doesn't run for those. Undo and redo are reported on the next turn that runs hooks, as `'rewind'` or `'redo'`, unless that turn is a retry: RVH first lines its history up with AID's, then reports `'retry'` for the response being regenerated. (Undoing just the last response and pressing Continue is reported as `'retry'` too: to AID and to RVH it is the same as retrying that response.)
-- **A count that retries don't move.** `getActionCount()` counts actions the same way `info.actionCount` does, rising in `RevampedHistory.input` and `RevampedHistory.context` as AID's does, but on a retry it doesn't move at all: not during the hooks, and not afterwards.
+- **A classification for every turn,** from `getCurrentChangeType()`: `'start'`, `'new'`, `'retry'`, `'rewind'` or `'redo'`. RVH works this out in `RevampedHistory.input` on a typed turn, and in `RevampedHistory.context` on a Continue or retry, since `onInput` doesn't run for those. Undo and redo are reported on the next turn that runs hooks, as `'rewind'` or `'redo'`, unless that turn is a retry: RVH first lines its history up with AID's, then reports `'retry'` for the response being regenerated. (Undoing or deleting just the last response and pressing Continue is reported as `'retry'` too. AID keeps the undone response as a version the player can swap back to, just as after a retry, and RVH keeps it in the new response's `retries`.)
+- **A count that retries don't move.** `getActionCount()` counts actions the same way `info.actionCount` does, rising in `RevampedHistory.input` and `RevampedHistory.context`, but on a retry it doesn't move at all: not during the hooks, and not afterwards. On a typed turn it rises in `RevampedHistory.context` while AID's waits until after `onOutput`, so from there to the end of the turn it reads one more than `info.actionCount`; the two agree again once the turn ends.
 - **A history that already reflects the retry.** After `RevampedHistory.context`, the retried response has been removed from RVH's history too, and it's kept in the new response's `retries`.
 
 `getActionCount()` still counts actions, not turns. For "how many turns has the player taken", count the player's entries, or keep your own counter in `scriptData` as in [the core pattern](#the-core-pattern-keep-state-on-the-entries).
@@ -309,11 +308,9 @@ When the first turn after an undo, rewind or redo is a retry, AID has already re
 
 ## Known Limitations
 
-Cases RVH handles imperfectly, or where it depends on something about AID that isn't settled. None of them loses data in ordinary play; they come up after unusual navigation.
+Cases RVH handles imperfectly. None of them loses data in ordinary play; they come up after unusual navigation.
 
 - **A retry straight after a redo RVH has no saved branch for, or after a rewind past everything RVH tracked.** RVH handles the turn as a redo or rewind followed by a new Continue: the retried response stays in its history and the new response is added after it, instead of replacing it. RVH keeps branches from the last five rewinds (`maxAltHistories`), so this mostly takes a long run of rewinds, a rewind all the way back past where RVH started tracking, or heavy edits to the redone entries so that no branch matches them.
-- **Undoing the last response and pressing Continue counts as a retry.** The undone response goes into the new response's `retries`, where it's treated like any other retried response, rather than being saved as a branch the player could redo to. AID itself doesn't distinguish the two either.
 - **Rewinding past the adventure's opening.** The next action is treated as a fresh start, and the original opening and first response stay at the front of RVH's history ahead of the new ones.
 - **Heavy edits to several recent entries at once.** RVH matches its history to AID's by text, and needs 7 of the last 10 entries to still match, with no more than two mismatches in a row. If the player rewrites more than that before their next action (three consecutive entries is enough), RVH reports the turn as `'redo'` rather than `'new'`, though it still refreshes the edited text.
 - **Which retry the player kept is a best guess.** RVH compares text, so when the retries are near-identical or the kept one was heavily edited, it can pick the wrong one. It flags those turns; see [Ambiguous Retry Resolution](./API-Reference.md#ambiguous-retry-resolution).
-- **Whether the typed action is in `history` during `onModelContext` is unsettled.** See [What's in `history` while the hooks run](#whats-in-history-while-the-hooks-run). RVH's own handling doesn't depend on it, but context-hook code in your script might.
