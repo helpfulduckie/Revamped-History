@@ -1126,11 +1126,14 @@ class RevampedHistory {
       if (aidCount < rvhCount) return { changeType: 'rewind', edits: [] };
       if (aidCount > rvhCount + 1) return { changeType: 'redo', edits: [] };
     
-      // aidCount === rvhCount → presumed retry (AID net-zeroed: -1 after output, +1 before input)
       // aidCount === rvhCount + 1 → presumed new action
+      // aidCount === rvhCount → presumed 'retry': AID's history is one action short of
+      // ours. A real retry never reaches the input hook, so the input hook treats this
+      // as an undo of one action followed by a new one (a rewind). The context hook
+      // detects Continue-retries itself (expectedAidContinueDepth) before calling here.
       const presumed = aidCount === rvhCount ? 'retry' : 'new';
     
-      // For retry, AID removed the last AI response from its history, so we skip our last entry.
+      // AID's history lacks our last entry, so we skip it when comparing.
       const rvhOffset = presumed === 'retry' ? 1 : 0;
       const result = findHistoryMatch(
         aidHistory, state.rvh.history, rvhOffset, LOOKBACK_WINDOW, SIMILARITY_THRESHOLD
@@ -1208,19 +1211,28 @@ class RevampedHistory {
       }
     }
     
+    // Matches AID's window against each saved branch's tail. When the first hooked
+    // turn after a redo is a retry, AID has already removed the branch's last
+    // response, so a branch that doesn't match as-is is tried again with its last
+    // entry skipped; the caller then treats the turn as a retry of that entry.
     function restoreAltHistory(state, aidCount, aidHistory) {
       let bestBranch = null;
-      let bestScore = -1;
     
-      for (const branch of state.rvh.altHistory) {
-        const branchEndCount = branch.firstTurn + branch.history.length;
-        if (Math.abs(branchEndCount - aidCount) > 4) continue;
+      for (const offset of [0, 1]) {
+        let bestScore = -1;
+        for (const branch of state.rvh.altHistory) {
+          const branchEndCount = branch.firstTurn + branch.history.length;
+          if (Math.abs(branchEndCount - aidCount) > 4) continue;
+          if (offset > 0 && branch.history.length <= offset) continue;
     
-        const result = findHistoryMatch(aidHistory, branch.history, 0, 5, SIMILARITY_THRESHOLD);
-        if (result.confident && result.matchedCount > bestScore) {
-          bestScore = result.matchedCount;
-          bestBranch = branch;
+          const result = findHistoryMatch(aidHistory, branch.history, offset, 5, SIMILARITY_THRESHOLD);
+          // With an offset, an empty comparison proves nothing, so require a real match.
+          if (result.confident && (offset === 0 || result.matchedCount > 0) && result.matchedCount > bestScore) {
+            bestScore = result.matchedCount;
+            bestBranch = branch;
+          }
         }
+        if (bestBranch) break;
       }
     
       if (!bestBranch) return false;
@@ -1266,10 +1278,11 @@ class RevampedHistory {
     // Rewind trims the tracked tail into an alt branch, or clears all tracking when
     // the rewind lands at or before the first tracked entry. Redo restores a matching
     // alt branch, or else seeds and backfills from the AID window. Once the histories
-    // line up, resolves which retry the player kept. Leaves actionCount at the
-    // committed count; the caller adds the pending action.
+    // line up, resolves which retry the player kept, unless resolveWinner is false
+    // (the context hook resolves it itself, after checking whether the turn is a retry).
+    // Leaves actionCount at the committed count; the caller adds the pending action.
     // Returns true when a rewind cleared all tracking (capture reason 'rewind-past-tracking').
-    function applyRewindOrRedo(state, aidHistory, changeType, aidCount, dbg = null) {
+    function applyRewindOrRedo(state, aidHistory, changeType, aidCount, dbg = null, resolveWinner = true) {
       const committedCount = aidCount - 1;
       let rewoundPastTracking = false;
     
@@ -1295,8 +1308,21 @@ class RevampedHistory {
         return false;
       }
     
-      resolveRetryWinner(state, aidHistory, dbg);
+      if (resolveWinner) resolveRetryWinner(state, aidHistory, dbg);
       return rewoundPastTracking;
+    }
+    
+    // After rewind/redo surgery on a turn with no input hook, our last entry should
+    // be AID's last. If AID's last matches our second-to-last instead, AID has
+    // already removed our last entry: the player undid, rewound or redid, and then
+    // retried the response that is now last.
+    function isRetryAfterNavigation(state, aidHistory) {
+      const ours = state.rvh.history;
+      const aidLast = aidHistory[aidHistory.length - 1];
+      if (!aidLast || ours.length < 2) return false;
+      if (ours[ours.length - 1].actionType !== 'continue') return false;
+      if (jaccardSimilarity(aidLast.text, ours[ours.length - 1].text) >= SIMILARITY_THRESHOLD) return false;
+      return jaccardSimilarity(aidLast.text, ours[ours.length - 2].text) >= SIMILARITY_THRESHOLD;
     }
     
     // Swaps entry.retries[retryIdx] in as the entry's canonical text, actionType and
@@ -1496,7 +1522,7 @@ class RevampedHistory {
       const unionCount = set1.size + set2.size - intersectionCount;
       return intersectionCount / unionCount;
     }
-    return { rvhDebug, updateDebugCard, updateAidDebugCard, getOrCreateCard, getStoryCardEntryByTitle, updateHistoryDebugCards, inferActionType, findHistoryMatch, classifyStateChange, trailingContinueCount, pushAction, startEntryBonus, countToIndex, trimToIndex, saveAltHistory, restoreAltHistory, restoreForkedBranch, applyRewindOrRedo, promoteRetry, resolveRetryWinner, freshenText, backfillFromAidHistory, captureUntrackedFromWindow, rvhEnsureInit, computeBigrams, jaccardSimilarity, DEBUG_CARD_TYPE, MATCH_CONFIDENCE_RATIO, LOOKBACK_WINDOW, MAX_CONSECUTIVE_MISMATCHES, AID_HISTORY_CAP, RVH_DEBUG_DEFAULT_LEVEL, AMBIGUOUS_DELTA, SIMILARITY_THRESHOLD };
+    return { rvhDebug, updateDebugCard, updateAidDebugCard, getOrCreateCard, getStoryCardEntryByTitle, updateHistoryDebugCards, inferActionType, findHistoryMatch, classifyStateChange, trailingContinueCount, pushAction, startEntryBonus, countToIndex, trimToIndex, saveAltHistory, restoreAltHistory, restoreForkedBranch, applyRewindOrRedo, isRetryAfterNavigation, promoteRetry, resolveRetryWinner, freshenText, backfillFromAidHistory, captureUntrackedFromWindow, rvhEnsureInit, computeBigrams, jaccardSimilarity, DEBUG_CARD_TYPE, MATCH_CONFIDENCE_RATIO, LOOKBACK_WINDOW, MAX_CONSECUTIVE_MISMATCHES, AID_HISTORY_CAP, RVH_DEBUG_DEFAULT_LEVEL, AMBIGUOUS_DELTA, SIMILARITY_THRESHOLD };
   })();
 
   static input(text) {
@@ -1508,7 +1534,11 @@ class RevampedHistory {
     state.rvh.capture   = null; // new turn — clear last turn's capture and ambiguity signals
     state.rvh.ambiguous = null;
   
-    const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
+    let { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
+    // AID never runs onInput on a retry, so equal counts here mean the player undid
+    // one action (the last AI response) and then typed a new one. The classifier's
+    // edits already skip our last entry, which is the one to trim, so they still apply.
+    if (changeType === 'retry') changeType = 'rewind';
     // Retry winner resolution compares AID's last entry with ours, so it only runs
     // once the two line up: here for a new action (before RevampedHistory.#lib.freshenText rewrites the
     // text it scores against), inside RevampedHistory.#lib.applyRewindOrRedo for rewind/redo.
@@ -1521,8 +1551,7 @@ class RevampedHistory {
     if (changeType === 'new' || changeType === 'rewind' || changeType === 'redo') state.rvh.actionCount++;
   
     if (changeType !== 'start') {
-      RevampedHistory.#lib.captureUntrackedFromWindow(state, history, committedCount,
-        changeType === 'retry' ? -1 : 0,
+      RevampedHistory.#lib.captureUntrackedFromWindow(state, history, committedCount, 0,
         rewoundPastTracking ? 'rewind-past-tracking' : undefined);
     }
   
@@ -1555,13 +1584,10 @@ class RevampedHistory {
     state.rvh.aiAction = { actionType: 'continue', text: null, scriptData: {} };
   
     if (state.rvh.playerAction) {
+      // The RevampedHistory.input hook never classifies a retry (AID runs no RevampedHistory.input hook on one).
       state.rvh.aiAction.changeType = state.rvh.playerAction.changeType;
-      if (state.rvh.playerAction.changeType !== 'retry') {
-        dbg.inform("Player Action");
-        state.rvh.actionCount++;
-      } else {
-        RevampedHistory.popRetryAiEntry(state);
-      }
+      dbg.inform("Player Action");
+      state.rvh.actionCount++;
     } else {
       // Input hook didn't run this turn, so any capture or ambiguity signal is stale.
       state.rvh.capture   = null;
@@ -1573,31 +1599,64 @@ class RevampedHistory {
       // Actions committed so far (AID pre-increments actionCount for the pending action).
       const committedCount = aidCount - 1;
       let rewoundPastTracking = false;
+      let changeType = null;
   
-      if (aidCount < rvhCount || aidCount > rvhCount + 1) {
-        // Counts alone say rewind or redo here; RevampedHistory.#lib.applyRewindOrRedo resolves the
-        // retry winner once the history surgery has lined our last entry up with AID's.
-        const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
-        RevampedHistory.#lib.freshenText(state, edits);
-        state.rvh.aiAction.changeType = changeType;
-        rewoundPastTracking = RevampedHistory.#lib.applyRewindOrRedo(state, history, changeType, aidCount, dbg);
-        state.rvh.actionCount++;
+      // Undo, rewind and redo run no hooks, and they can net out so that the counts
+      // still line up, so each count-based guess is confirmed against the text.
+      const countsLineUp = aidCount === rvhCount + 1 || aidCount === rvhCount;
+      const retryShaped  = RevampedHistory.#lib.trailingContinueCount(history) < state.rvh.expectedAidContinueDepth;
+  
+      // After history surgery: a retry if AID has already dropped our last entry,
+      // otherwise settle the timeline change as a normal turn.
+      const settleAfterNavigation = (navType) => {
+        if (RevampedHistory.#lib.isRetryAfterNavigation(state, history)) return 'retry';
+        RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
+        RevampedHistory.#lib.freshenText(state, RevampedHistory.#lib.findHistoryMatch(history, state.rvh.history, 0, RevampedHistory.#lib.LOOKBACK_WINDOW, RevampedHistory.#lib.SIMILARITY_THRESHOLD).edits);
+        return navType;
+      };
+      // The count-based guesses tolerate an edited entry or two, which also lets
+      // through a timeline the player redid onto. When the newest compared pair
+      // disagrees, a saved branch that matches AID's window takes precedence.
+      const newestPairMatches = (rvhOffset) => {
+        const aidLast = history[history.length - 1];
+        const ours = state.rvh.history[state.rvh.history.length - 1 - rvhOffset];
+        return !!aidLast && !!ours && RevampedHistory.#lib.jaccardSimilarity(aidLast.text, ours.text) >= RevampedHistory.#lib.SIMILARITY_THRESHOLD;
+      };
+  
+      if (countsLineUp && retryShaped &&
+          RevampedHistory.#lib.findHistoryMatch(history, state.rvh.history, 1, RevampedHistory.#lib.LOOKBACK_WINDOW, RevampedHistory.#lib.SIMILARITY_THRESHOLD).confident) {
+        // A retry, or an undo of the last response followed by Continue: AID's
+        // history is ours without our last entry.
+        changeType = !newestPairMatches(1) && RevampedHistory.#lib.restoreAltHistory(state, committedCount, history)
+          ? settleAfterNavigation('redo')
+          : 'retry';
+      } else if (countsLineUp && !retryShaped) {
+        const classified = RevampedHistory.#lib.classifyStateChange(info, state, history);
+        if (classified.changeType === 'new' && !newestPairMatches(0) && RevampedHistory.#lib.restoreAltHistory(state, committedCount, history)) {
+          changeType = settleAfterNavigation('redo');
+        } else if (classified.changeType !== 'redo') {
+          if (classified.changeType === 'new') RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
+          RevampedHistory.#lib.freshenText(state, classified.edits);
+          changeType = classified.changeType;
+        }
+        // 'redo' (our history doesn't match AID's): handled as a timeline change below.
+      }
+  
+      if (!changeType) {
+        // The timeline moved since the last turn (undo, rewind or redo), and this
+        // turn may also be a retry of the response the player landed on.
+        const navType = committedCount < rvhCount ? 'rewind' : 'redo';
+        rewoundPastTracking = RevampedHistory.#lib.applyRewindOrRedo(state, history, navType, aidCount, dbg, false);
+        changeType = rewoundPastTracking ? navType : settleAfterNavigation(navType);
+        if (rewoundPastTracking) RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
+      }
+  
+      if (changeType === 'retry') {
+        RevampedHistory.popRetryAiEntry(state);
+        state.rvh.playerAction = { changeType: 'retry', actionType: 'continue', text: null, scriptData: {} };
       } else {
-        let aidTrailing = 0;
-        for (let i = history.length - 1; i >= 0; i--) {
-          if (history[i].type !== 'continue') break;
-          aidTrailing++;
-        }
-        if (aidTrailing < state.rvh.expectedAidContinueDepth) {
-          RevampedHistory.popRetryAiEntry(state);
-          state.rvh.playerAction = { changeType: 'retry', actionType: 'continue', text: null, scriptData: {} };
-        } else {
-          const { changeType, edits } = RevampedHistory.#lib.classifyStateChange(info, state, history);
-          if (changeType === 'new') RevampedHistory.#lib.resolveRetryWinner(state, history, dbg);
-          RevampedHistory.#lib.freshenText(state, edits);
-          state.rvh.aiAction.changeType = changeType;
-          state.rvh.actionCount++;
-        }
+        state.rvh.aiAction.changeType = changeType;
+        state.rvh.actionCount++;
       }
   
       RevampedHistory.#lib.captureUntrackedFromWindow(state, history, committedCount, 0,
