@@ -205,11 +205,15 @@ Check that each hook calls `UnifiedSettings.<hook>(text)`, above RVH's body call
 
 When the retries are too similar to tell apart, RVH flags the turn so your script can correct it. See [Ambiguous Retry Resolution](./documentation/API-Reference.md#ambiguous-retry-resolution).
 
+### Something else looks wrong after an undo, rewind or redo
+
+A few unusual navigation sequences aren't handled perfectly yet. The Guide's [Known Limitations](./documentation/Guide.md#known-limitations) lists them.
+
 ---
 
 ## Documentation
 
-- **[Guide](./documentation/Guide.md)** — the core pattern, what happens to your data on each kind of turn, recipes, and how RVH detects turns.
+- **[Guide](./documentation/Guide.md)** — the core pattern, what happens to your data on each kind of turn, recipes, how RVH detects turns, and known limitations.
 - **[API Reference](./documentation/API-Reference.md)** — every method, and the internals of `state.rvh`.
 - **[Changelog](./CHANGELOG.md)** — what changed in each version, including upgrading to 2.0.0.
 

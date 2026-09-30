@@ -24,6 +24,7 @@ How to build a script on Revamped History: the one pattern most scripts need, wh
 - [Indices and Action Counts](#indices-and-action-counts)
 - [Keeping scriptData Small](#keeping-scriptdata-small)
 - [How RVH Detects Turns](#how-rvh-detects-turns)
+- [Known Limitations](#known-limitations)
 
 ---
 
@@ -303,3 +304,16 @@ This comparison only means something once AID's last entry and RVH's are the sam
 A rewind trims the entries after the rewind point into a saved alt branch. A redo looks for a saved branch that ends near AID's new count and whose last entries match AID's window, and restores it. If none matches, RVH copies the redone actions from AID's window instead. Undo and redo can net out so that the counts look like an ordinary turn; when AID's newest entry doesn't match RVH's, RVH checks the saved branches before trusting the counts.
 
 When the first turn after an undo, rewind or redo is a retry, AID has already removed the response being retried, so its window is one entry short of the timeline the player landed on. RVH allows for that when matching branches, and once its history is lined up, treats the turn as a retry of its last response. A rewind that goes back past everything RVH tracked clears its history, saves it as a branch, and rebuilds from AID's window; redoing to that branch later restores what it can and fills the gap from the window.
+
+---
+
+## Known Limitations
+
+Cases RVH handles imperfectly, or where it depends on something about AID that isn't settled. None of them loses data in ordinary play; they come up after unusual navigation.
+
+- **A retry straight after a redo RVH has no saved branch for, or after a rewind past everything RVH tracked.** RVH handles the turn as a redo or rewind followed by a new Continue: the retried response stays in its history and the new response is added after it, instead of replacing it. RVH keeps branches from the last five rewinds (`maxAltHistories`), so this mostly takes a long run of rewinds, a rewind all the way back past where RVH started tracking, or heavy edits to the redone entries so that no branch matches them.
+- **Undoing the last response and pressing Continue counts as a retry.** The undone response goes into the new response's `retries`, where it's treated like any other retried response, rather than being saved as a branch the player could redo to. AID itself doesn't distinguish the two either.
+- **Rewinding past the adventure's opening.** The next action is treated as a fresh start, and the original opening and first response stay at the front of RVH's history ahead of the new ones.
+- **Heavy edits to several recent entries at once.** RVH matches its history to AID's by text, and needs 7 of the last 10 entries to still match, with no more than two mismatches in a row. If the player rewrites more than that before their next action (three consecutive entries is enough), RVH reports the turn as `'redo'` rather than `'new'`, though it still refreshes the edited text.
+- **Which retry the player kept is a best guess.** RVH compares text, so when the retries are near-identical or the kept one was heavily edited, it can pick the wrong one. It flags those turns; see [Ambiguous Retry Resolution](./API-Reference.md#ambiguous-retry-resolution).
+- **Whether the typed action is in `history` during `onModelContext` is unsettled.** See [What's in `history` while the hooks run](#whats-in-history-while-the-hooks-run). RVH's own handling doesn't depend on it, but context-hook code in your script might.
